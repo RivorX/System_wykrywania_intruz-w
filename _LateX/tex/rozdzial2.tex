@@ -1,0 +1,28 @@
+\clearpage
+\section{Wymagania funkcjonalne i niefunkcjonalne}		%2
+
+W rozdziale przedstawiono wymagania systemu wykrywania intruzow opartego na analizie obrazu z kamer. System ma wspierac ochrone firmy poprzez automatyczne wykrywanie zdarzen niebezpiecznych i szybkie powiadamianie operatora.
+
+\subsection{Wymagania funkcjonalne}
+\begin{itemize}
+\item System musi pobierac obraz na zywo z wielu kamer monitoringu.
+\item System musi wykrywac obecnosc i ruch osob w polu widzenia kamery.
+\item System musi dzialac w dwoch trybach pracy: dziennym i nocnym.
+\item W trybie nocnym system musi oznaczac kazdy wykryty ruch osoby jako potencjalny incydent.
+\item W trybie dziennym system musi wykrywac osoby niepozadane lub osoby przebywajace w strefach bez uprawnien.
+\item System musi zapisywac informacje o incydencie: czas, identyfikator kamery oraz klatke obrazu.
+\item System musi generowac powiadomienie dla operatora po wykryciu incydentu.
+\item System musi umozliwiac przeglad historii wykrytych zdarzen.
+\end{itemize}
+
+\subsection{Wymagania niefunkcjonalne}
+\begin{itemize}
+\item System powinien analizowac obraz w czasie zblizonym do rzeczywistego.
+\item System powinien cechowac sie wysoka skutecznoscia wykrywania intruzow przy ograniczeniu falszywych alarmow.
+\item System powinien byc stabilny i dzialac ciagle przez dlugi czas bez restartu.
+\item System powinien byc skalowalny, tak aby mozna bylo dodawac kolejne kamery bez przebudowy calego rozwiazania.
+\item System powinien zapewniac bezpieczenstwo danych, w tym ograniczony dostep do nagran i logow.
+\item System powinien przechowywac dane incydentow w uporzadkowany i latwy do audytu sposob.
+\item System powinien umozliwiac latwa konfiguracje parametrow detekcji dla roznych stref.
+\item Interfejs operatora powinien byc czytelny i prosty w obsludze.
+\end{itemize}
