@@ -1,0 +1,17 @@
+--extra-index-url https://download.pytorch.org/whl/cu128
+
+torch==2.10.0+cu128; platform_system == "Windows"
+torchvision==0.25.0+cu128; platform_system == "Windows"
+torchaudio==2.10.0+cu128; platform_system == "Windows"
+
+ultralytics>=8.3.0
+opencv-python>=4.10.0
+pyyaml>=6.0.1
+requests>=2.32.0
+numpy>=1.26.0
+pandas>=2.2.0
+matplotlib>=3.8.0
+tqdm>=4.66.0
+PyQt6>=6.7.0
+triton-windows>=3.2.0; platform_system == "Windows"
+lap>=0.5.12

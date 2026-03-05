@@ -1,0 +1,101 @@
+project:
+  name: intrusion_detection
+  logs_dir: logs/train
+  runs_prefix: auto # auto => bierze prefix z model.name, np. yolo26n_train
+
+model:
+  # Model guide (dla YOLO26):
+  # - yolo26n.pt: najszybszy, najmniejszy, dobry na start i 1k-3k obrazow
+  # - yolo26s.pt: lepsza jakosc przy nadal sensownym czasie, 2k-8k obrazow
+  # - yolo26m.pt: dobry balans jakosc/czas, warto celowac w 5k+ obrazow
+  # - yolo26l.pt: wysoka jakosc, ale wolny i VRAM-heavy (raczej >=8GB VRAM)
+  name: yolo26n.pt
+  local_weights_dir: models/base
+  auto_download: true
+  download_url:
+  fallback_name:
+  use_fallback: false
+  force_redownload: false
+
+data:
+  dataset_config_path: config/dataset.yaml
+  auto_prepare: true
+  dataset_yaml_path:
+
+training:
+  run_name:
+  epochs: 100
+  imgsz: 640
+  batch: auto
+  device: 0
+  workers: 4
+  patience: 30
+  optimizer: auto
+  lr0: 0.01
+  lrf: 0.01
+  cos_lr: true
+  weight_decay: 0.0005
+  warmup_epochs: 3
+  classes:
+    - 0
+  compile: true
+  fix_unicode_cache_paths: true
+  cache_root_dir: D:/torch_cache
+  force_project_datasets_dir: true
+  datasets_dir: data/raw/ultralytics_datasets
+  cache: false
+  exist_ok: false
+  save_period: -1 # <1 => bez epoch*.pt, zostaja tylko best.pt i last.pt
+  plots: true
+  export_weights:
+    enabled: true
+    export_dir: models/weights
+    latest_subdir: latest
+    include_run_named: false # true => dodatkowo kopie <run_name>_best.pt i <run_name>_last.pt
+  results_plot:
+    enabled: true
+    every_n_epochs: 5
+    snapshots_subdir: plots
+    max_snapshots: 0 # 0 => bez limitu, >0 => trzyma ostatnie N snapshotow
+  cpu_batch_fallback: 2
+  augmentation:
+    hsv_h: 0.01
+    hsv_s: 0.45
+    hsv_v: 0.25
+    translate: 0.04
+    scale: 0.25
+    fliplr: 0.3
+    flipud: 0.0
+    mosaic: 0.35
+    mixup: 0.0
+    copy_paste: 0.0
+    erasing: 0.15
+  auto_batch:
+    probe_method: synthetic
+    fallback_to_mini_train: false
+    reuse_synthetic_state: true
+    cache_enabled: true
+    cache_path: logs/train/auto_batch_compiled_cache.json
+    cache_max_entries: 200
+    cache_max_age_hours: 168
+    min_batch: 2
+    start_batch: 8
+    max_batch: 64
+    growth_factor: 2
+    safety_factor: 0.9
+    multiple_of: 2
+    max_probes: 9
+    probe_fraction: 0.02
+    probe_workers: 0
+    probe_logs_dir: logs/train/_autobatch
+    keep_probe_artifacts: false
+    respect_compile: true
+    compile_mode: default
+    compile_dynamic: false
+    fallback_disable_compile_on_error: true
+    probe_amp: true
+    max_vram_utilization: 0.86
+    max_vram_metric: allocated
+    synthetic_warmup_steps: 1
+    synthetic_measure_steps: 1
+    synthetic_reduce_tensors: 8

@@ -1,0 +1,50 @@
+dataset:
+  name: intrusion_people
+  output_dir: data/processed/intrusion_people
+  dataset_yaml_name: dataset.yaml
+
+download:
+  provider: coco_person_subset
+  auto_download: true
+  async_download: true
+  max_download_workers: 12
+  retry_attempts: 2
+  show_file_progress: false
+  show_overall_progress: true
+  force_extract: false
+  download_dir: data/raw/coco_subset
+  extract_dir: data/raw/coco_subset/source
+  annotations_url: http://images.cocodataset.org/annotations/annotations_trainval2017.zip
+  annotations_archive_name: annotations_trainval2017.zip
+  annotations_extract_dir: data/raw/coco_subset/annotations_trainval2017
+  images_base_url: http://images.cocodataset.org
+  include_splits:
+    - train2017
+    - val2017
+  target_category_ids:
+    - 1
+
+source_layout:
+  images_dir: images
+  labels_dir: labels
+  recurse_images: true
+
+prepare:
+  force_prepare: false
+  keep_only_annotated: true
+  limit_mode: cap      # cap | max
+  # Dataset size hint:
+  # - 1k: szybkie eksperymenty (lepiej n/s)
+  # - 3k-5k: sensowny trening m
+  # - 8k+: mocniej dla m/l
+  max_images: 1000     # np. 1000, 10000; przy limit_mode=max bierze wszystko
+  sampling_mode: random # random | head
+  filter_classes:
+    - 0
+  class_names:
+    - person
+  split:
+    train: 0.7
+    val: 0.2
+    test: 0.1
+  seed: 42

@@ -27,22 +27,21 @@ Thumbs.db
 *.csv
 *.npz
 
-# Training logs
-logs/*
-!logs/.gitkeep
+# Training outputs
+logs
 
-# Ignore all logs and results except .gitkeep (if you want to keep folder structure)
+# Model and data artifacts
+models/
+*.pt
+data
 
 # Misc
 *.swp
 *.bak
 
-logs
-
-# Ignorowanie plików tymczasowych LaTeX
+# LaTeX temporary files
 *.toc
 *.aux
-*.log
 *.out
 *.bbl
 *.bbl-SAVE-ERROR

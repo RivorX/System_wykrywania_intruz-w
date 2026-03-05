@@ -1,0 +1,74 @@
+model:
+  name: yolo26n.pt
+  local_weights_dir: models/base
+  auto_download: true
+  trained_weights:
+    enabled: true
+    dir: models/weights/latest
+    preferred: best
+    prefer_canonical: true
+    fallback_to_base: true
+  download_url: null
+  fallback_name: null
+  use_fallback: false
+  force_redownload: false
+  selected_model_path: models\base\yolo26n.pt
+inference:
+  conf: 0.27
+  iou: 0.42
+  imgsz: 960
+  max_det: 100
+  classes:
+  - 0
+  device: '0'
+  half: true
+  compile: false
+  fix_unicode_cache_paths: true
+  cache_root_dir: D:/torch_cache
+tracker:
+  enabled: true
+  frame_rate: 30
+  track_high_thresh: 0.5
+  track_low_thresh: 0.1
+  new_track_thresh: 0.6
+  track_buffer: 30
+  match_thresh: 0.8
+  fuse_score: true
+security:
+  mode: auto
+  night_start_hour: 22
+  night_end_hour: 6
+  day_person_threshold: 1
+  night_person_threshold: 1
+events:
+  enabled: true
+  min_visible_seconds: 4.0
+  cooldown_seconds: 11.0
+  min_person_count: 1
+  max_saved_events: 302
+  save_annotated_frame: true
+  once_per_streak: true
+  output_dir: logs/app/events
+runtime:
+  scan_max_index: 8
+  auto_start_live: true
+  auto_scan_cameras_on_startup: false
+  suppress_opencv_warnings: true
+  console_logs: false
+  loop_videos: true
+  window_title: Intrusion Detection - Multi Source
+  start_fullscreen: true
+  start_maximized: true
+  grid_columns: auto
+  last_recording_path: data\videos\demo.mp4
+  frame_interval_ms: 16
+  view_target_fps: 60.0
+  view_cap_to_source_fps: true
+  video_fps_fallback: 25.0
+  model_target_fps: 8.0
+  max_infer_per_tick: 2
+  capture_buffer_size: 1
+  camera_width: 1280
+  camera_height: 720
+  camera_fps: 30
+  live_tile_spacing: 3
