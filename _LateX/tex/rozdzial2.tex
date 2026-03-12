@@ -1,28 +1,33 @@
 \clearpage
 \section{Wymagania funkcjonalne i niefunkcjonalne}		%2
 
-W rozdziale przedstawiono wymagania systemu wykrywania intruzow opartego na analizie obrazu z kamer. System ma wspierac ochrone firmy poprzez automatyczne wykrywanie zdarzen niebezpiecznych i szybkie powiadamianie operatora.
+W rozdziale przedstawiono wymagania dla systemu wykrywania intruzów opartego na analizie obrazu z kamer, plików wideo oraz strumieni sieciowych. Celem systemu jest wspomaganie ochrony obiektu poprzez automatyczne wykrywanie obecności osób, ocenę zgodności ubioru z przyjętym wzorcem stroju firmowego, archiwizację zdarzeń oraz szybkie przekazywanie informacji operatorowi.
 
 \subsection{Wymagania funkcjonalne}
 \begin{itemize}
-\item System musi pobierac obraz na zywo z wielu kamer monitoringu.
-\item System musi wykrywac obecnosc i ruch osob w polu widzenia kamery.
-\item System musi dzialac w dwoch trybach pracy: dziennym i nocnym.
-\item W trybie nocnym system musi oznaczac kazdy wykryty ruch osoby jako potencjalny incydent.
-\item W trybie dziennym system musi wykrywac osoby niepozadane lub osoby przebywajace w strefach bez uprawnien.
-\item System musi zapisywac informacje o incydencie: czas, identyfikator kamery oraz klatke obrazu.
-\item System musi generowac powiadomienie dla operatora po wykryciu incydentu.
-\item System musi umozliwiac przeglad historii wykrytych zdarzen.
+\item System musi obsługiwać wiele źródeł obrazu, w szczególności kamery lokalne, pliki wideo oraz strumienie sieciowe.
+\item System musi wykrywać osoby w obrazie z wykorzystaniem modelu detekcji obiektów oraz umożliwiać ich śledzenie pomiędzy kolejnymi klatkami.
+\item System musi pracować w dwóch trybach: dziennym oraz nocnym, przy czym wybór trybu może być realizowany automatycznie na podstawie harmonogramu lub ręcznie przez operatora.
+\item System musi wyznaczać dla wykrytej osoby obszar analizy ubioru na podstawie maski powiązanej z obramowaniem detekcji, tak aby możliwe było określenie dominującego koloru stroju.
+\item System musi umożliwiać zdefiniowanie wzorca ogólnego koloru stroju firmowego, do którego porównywany jest dominujący kolor ubioru wykrytej osoby.
+\item W trybie dziennym system musi oznaczać jako potencjalnego intruza tylko te osoby, których dominujący kolor stroju nie odpowiada przyjętemu wzorcowi ubioru firmowego.
+\item W trybie nocnym system musi traktować każdą wykrytą osobę jako potencjalny incydent, niezależnie od koloru ubioru.
+\item System musi pozwalać na konfigurację progów detekcji, parametrów alarmu oraz zasad archiwizacji zdarzeń z poziomu interfejsu operatora.
+\item System musi rejestrować informacje o incydencie, w szczególności czas wykrycia, identyfikator źródła, tryb pracy, liczbę wykrytych osób oraz zapisany materiał dowodowy.
+\item System musi archiwizować zdarzenia w postaci klatki lub klipu wideo, gdy osoba pozostaje widoczna przez zdefiniowany czas.
+\item System musi prezentować operatorowi podgląd na żywo z wielu źródeł oraz sygnalizować stan alarmowy dla wybranego źródła.
+\item System musi umożliwiać przegląd historii wykrytych zdarzeń wraz z podglądem zapisanego materiału.
 \end{itemize}
 
 \subsection{Wymagania niefunkcjonalne}
 \begin{itemize}
-\item System powinien analizowac obraz w czasie zblizonym do rzeczywistego.
-\item System powinien cechowac sie wysoka skutecznoscia wykrywania intruzow przy ograniczeniu falszywych alarmow.
-\item System powinien byc stabilny i dzialac ciagle przez dlugi czas bez restartu.
-\item System powinien byc skalowalny, tak aby mozna bylo dodawac kolejne kamery bez przebudowy calego rozwiazania.
-\item System powinien zapewniac bezpieczenstwo danych, w tym ograniczony dostep do nagran i logow.
-\item System powinien przechowywac dane incydentow w uporzadkowany i latwy do audytu sposob.
-\item System powinien umozliwiac latwa konfiguracje parametrow detekcji dla roznych stref.
-\item Interfejs operatora powinien byc czytelny i prosty w obsludze.
+\item System powinien analizować obraz w czasie zbliżonym do rzeczywistego, tak aby opóźnienie pomiędzy pojawieniem się osoby a jej wykryciem było możliwie małe.
+\item System powinien zapewniać wysoką skuteczność detekcji osób oraz ograniczać liczbę fałszywych alarmów, zwłaszcza w trybie dziennym opartym na analizie koloru ubioru.
+\item System powinien być odporny na długotrwałą pracę ciągłą i zachowywać stabilność podczas jednoczesnej obsługi wielu źródeł obrazu.
+\item System powinien być skalowalny, aby możliwe było dodawanie kolejnych kamer lub strumieni bez konieczności przebudowy całej architektury.
+\item System powinien umożliwiać łatwą rekonfigurację parametrów modelu, progów alarmowych, trybu pracy oraz ustawień archiwizacji.
+\item System powinien przechowywać zdarzenia i logi w sposób uporządkowany, tak aby możliwy był ich późniejszy przegląd, audyt oraz analiza.
+\item System powinien zapewniać modularną budowę, umożliwiającą dalsze rozszerzenie o bardziej zaawansowane metody segmentacji, analizy kolorów oraz klasyfikacji ubioru.
+\item System powinien zapewniać bezpieczeństwo danych oraz ograniczenie dostępu do zapisanych nagrań, logów i konfiguracji.
+\item Interfejs operatora powinien być czytelny, prosty w obsłudze i dostosowany do szybkiej oceny sytuacji alarmowej.
 \end{itemize}

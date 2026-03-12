@@ -1,14 +1,16 @@
 \clearpage
 \section{Nazwa i opis projektu}		%1
 
-Projekt nosi nazwe \textbf{System wykrywania intruzow}. Jego celem jest zwiekszenie bezpieczenstwa firmy poprzez automatyczna analize obrazu z kamer monitoringu i szybkie wykrywanie sytuacji niepozadanych.
+Projekt nosi nazwę \textbf{System wykrywania intruzów}. Jego celem jest zwiększenie bezpieczeństwa firmy poprzez automatyczną analizę obrazu z kamer monitoringu oraz szybkie wykrywanie sytuacji niepożądanych.
 
-System dziala w oparciu o kamery rozmieszczone w wybranych strefach obiektu (wejscia, korytarze, magazyny, strefy ograniczonego dostepu). Strumien wideo jest analizowany na biezaco, a wykryte zdarzenia sa klasyfikowane zgodnie z pora dnia.
+System działa w oparciu o kamery rozmieszczone w wybranych strefach obiektu, takich jak wejścia, korytarze, magazyny oraz strefy ograniczonego dostępu. Obraz z kamer, a także z innych źródeł wideo, jest analizowany na bieżąco, a wykryte zdarzenia są klasyfikowane zgodnie z porą dnia oraz przyjętymi regułami bezpieczeństwa.
+
+Istotnym elementem projektu jest rozróżnienie sposobu działania systemu w zależności od trybu pracy. W ciągu dnia system analizuje wygląd wykrytych osób i porównuje dominujący kolor ubioru z ogólnym wzorcem stroju firmowego. W tym celu wykorzystywany jest obszar osoby wyznaczony na podstawie maski powiązanej z detekcją, co pozwala ograniczyć wpływ tła na analizę koloru. W ciągu nocy system przyjmuje bardziej restrykcyjne założenie i traktuje każdą wykrytą osobę jako potencjalnego intruza.
 
 \begin{itemize}
-\item \textbf{Tryb nocny}: kazdy wykryty ruch osob traktowany jest jako potencjalne naruszenie bezpieczenstwa.
-\item \textbf{Tryb dzienny}: system koncentruje sie na identyfikacji osob niepozadanych lub obecnosci osob w strefach, do ktorych nie maja uprawnien.
-\item \textbf{Reakcja systemu}: po wykryciu incydentu zapisywane sa klatki i czas zdarzenia, a operator moze otrzymac powiadomienie.
+\item \textbf{Tryb nocny}: każda wykryta osoba traktowana jest jako potencjalne naruszenie bezpieczeństwa.
+\item \textbf{Tryb dzienny}: system koncentruje się na identyfikacji osób, których ubiór nie odpowiada ogólnemu kolorowi stroju firmowego, a tym samym mogą być uznane za osoby niepożądane.
+\item \textbf{Reakcja systemu}: po wykryciu incydentu zapisywany jest czas zdarzenia oraz materiał dowodowy w postaci klatki lub klipu, a operator może otrzymać informację o alarmie.
 \end{itemize}
 
-Projekt stanowi baze do dalszego rozwoju, m.in. o integracje z kontrola dostepu, dokladniejsza analize zachowan oraz raportowanie incydentow.
+Projekt stanowi bazę do dalszego rozwoju, między innymi o integrację z systemami kontroli dostępu, dokładniejszą analizę zachowań osób oraz rozbudowane raportowanie incydentów.
