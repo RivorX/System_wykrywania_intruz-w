@@ -4,6 +4,7 @@ import ctypes
 from datetime import datetime
 from math import ceil
 import os
+import random
 from pathlib import Path
 from typing import Any
 
@@ -113,10 +114,34 @@ def open_capture(source: dict[str, Any]) -> cv2.VideoCapture:
         return _open_camera_capture(camera_index)
 
     if source_type == "video":
-        return open_video_file_capture(str(raw_value))
+        capture = open_video_file_capture(str(raw_value))
+        if bool(source.get("random_start", False)):
+            _seek_random_start(capture)
+        return capture
 
     # stream type (rtsp/http/etc.)
     return cv2.VideoCapture(str(raw_value))
+
+
+def _seek_random_start(capture: cv2.VideoCapture) -> None:
+    try:
+        frame_count = float(capture.get(cv2.CAP_PROP_FRAME_COUNT))
+        fps = float(capture.get(cv2.CAP_PROP_FPS))
+        if frame_count > 1:
+            target = random.randint(0, int(frame_count) - 1)
+            capture.set(cv2.CAP_PROP_POS_FRAMES, float(target))
+            return
+
+        # Fallback: try random ratio if frame count is missing.
+        if capture.set(cv2.CAP_PROP_POS_AVI_RATIO, random.random()):
+            return
+
+        # Last resort: seek to random ms within first 30s if fps is known.
+        if fps > 1.0:
+            max_ms = int(30000)
+            capture.set(cv2.CAP_PROP_POS_MSEC, float(random.randint(0, max_ms)))
+    except Exception:  # noqa: BLE001
+        return
 
 
 def count_detections_for_class(result: Any, class_id: int = 0) -> int:

@@ -20,8 +20,8 @@ import cv2
 import numpy as np
 from ultralytics import YOLO
 
-from PyQt6.QtCore import QEvent, QPoint, QSize, Qt, QTimer, pyqtSignal
-from PyQt6.QtGui import QImage, QPixmap
+from PyQt6.QtCore import QEvent, QPoint, QPointF, QRectF, QSize, Qt, QTimer, pyqtSignal
+from PyQt6.QtGui import QColor, QImage, QPainter, QPen, QPixmap, QPolygonF
 from PyQt6.QtWidgets import (
     QApplication,
     QAbstractItemView,
@@ -30,6 +30,8 @@ from PyQt6.QtWidgets import (
     QDoubleSpinBox,
     QFileDialog,
     QFrame,
+    QDialog,
+    QDialogButtonBox,
     QGridLayout,
     QGroupBox,
     QHBoxLayout,
@@ -43,12 +45,12 @@ from PyQt6.QtWidgets import (
     QSlider,
     QSpinBox,
     QSizePolicy,
+    QStackedWidget,
     QSplitter,
     QTabWidget,
     QTableWidget,
     QTableWidgetItem,
     QTextEdit,
-    QToolBox,
     QVBoxLayout,
     QWidget,
 )
@@ -189,6 +191,12 @@ def _extract_run_name_from_weight_filename(filename: str) -> str | None:
 def _infer_model_family(name: str) -> str:
     text = str(name or "").lower()
     for family in ("yolo26n", "yolo26s", "yolo26m", "yolo26l", "yolo26x"):
+        if family in text:
+            return family
+    for family in ("yolov8n", "yolov8s", "yolov8m", "yolov8l", "yolov8x"):
+        if family in text:
+            return family
+    for family in ("yolov5n", "yolov5s", "yolov5m", "yolov5l", "yolov5x"):
         if family in text:
             return family
     return "-"
@@ -661,6 +669,181 @@ class VideoTile(QWidget):
         self.canvas.set_frame(frame, zoom=zoom, pan_x=pan_x, pan_y=pan_y)
 
 
+class MaskEditorWidget(QWidget):
+    def __init__(self, frame: np.ndarray, poly_norm: list[list[tuple[float, float]]] | list[tuple[float, float]] | None) -> None:
+        super().__init__()
+        self._polys_norm: list[list[tuple[float, float]]] = []
+        if poly_norm:
+            if poly_norm and isinstance(poly_norm[0], (list, tuple)) and len(poly_norm) > 0:
+                # Either list of points or list of polygons; normalize.
+                first = poly_norm[0]  # type: ignore[index]
+                if first and isinstance(first, (list, tuple)) and len(first) == 2 and isinstance(first[0], (int, float)):
+                    self._polys_norm = [list(poly_norm)]  # type: ignore[list-item]
+                else:
+                    self._polys_norm = [list(poly) for poly in poly_norm]  # type: ignore[arg-type]
+        self._current_poly: list[tuple[float, float]] = []
+        self._dragging = False
+        self._drag_start: tuple[float, float] | None = None
+        self._last_point: tuple[float, float] | None = None
+        self._pixmap: QPixmap | None = None
+        self._img_w = 0
+        self._img_h = 0
+        self.setMinimumSize(480, 270)
+        self.set_frame(frame)
+
+    def set_frame(self, frame: np.ndarray) -> None:
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        height, width = rgb.shape[:2]
+        image = QImage(rgb.data, width, height, width * 3, QImage.Format.Format_RGB888)
+        self._pixmap = QPixmap.fromImage(image)
+        self._img_w = width
+        self._img_h = height
+        self.update()
+
+    def clear_rect(self) -> None:
+        self._polys_norm = []
+        self._current_poly = []
+        self.update()
+
+    def get_rect(self) -> list[list[tuple[float, float]]]:
+        return [list(poly) for poly in self._polys_norm]
+
+    def _display_rect(self) -> tuple[float, float, float, float, float]:
+        if self._pixmap is None or self._pixmap.isNull():
+            return 0.0, 0.0, 0.0, 0.0, 1.0
+        w = max(1, self.width())
+        h = max(1, self.height())
+        scale = min(w / float(self._img_w), h / float(self._img_h))
+        disp_w = self._img_w * scale
+        disp_h = self._img_h * scale
+        offset_x = (w - disp_w) / 2.0
+        offset_y = (h - disp_h) / 2.0
+        return offset_x, offset_y, disp_w, disp_h, scale
+
+    def _widget_to_image(self, x: float, y: float) -> tuple[float, float] | None:
+        offset_x, offset_y, disp_w, disp_h, scale = self._display_rect()
+        if disp_w <= 0 or disp_h <= 0:
+            return None
+        clamped_x = _clamp(x, offset_x, offset_x + disp_w)
+        clamped_y = _clamp(y, offset_y, offset_y + disp_h)
+        img_x = (clamped_x - offset_x) / scale
+        img_y = (clamped_y - offset_y) / scale
+        return _clamp(img_x, 0.0, float(self._img_w)), _clamp(img_y, 0.0, float(self._img_h))
+
+    def paintEvent(self, event: Any) -> None:  # noqa: ANN401
+        super().paintEvent(event)
+        if self._pixmap is None or self._pixmap.isNull():
+            return
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+        offset_x, offset_y, disp_w, disp_h, _ = self._display_rect()
+        target = QRectF(offset_x, offset_y, disp_w, disp_h)
+        painter.drawPixmap(target, self._pixmap, QRectF(self._pixmap.rect()))
+
+        if self._polys_norm:
+            painter.setPen(QPen(QColor(255, 80, 80), 2))
+            painter.setBrush(QColor(255, 80, 80, 40))
+            for poly_norm in self._polys_norm:
+                if len(poly_norm) < 3:
+                    continue
+                points = [QPointF(offset_x + x * disp_w, offset_y + y * disp_h) for x, y in poly_norm]
+                painter.drawPolygon(QPolygonF(points))
+
+        if self._current_poly and len(self._current_poly) >= 2:
+            painter.setPen(QPen(QColor(255, 120, 120), 2))
+            painter.setBrush(QColor(255, 120, 120, 20))
+            points = [QPointF(offset_x + x * disp_w, offset_y + y * disp_h) for x, y in self._current_poly]
+            painter.drawPolyline(QPolygonF(points))
+
+    def mousePressEvent(self, event: Any) -> None:  # noqa: ANN401
+        if event.button() != Qt.MouseButton.LeftButton:
+            return
+        point = event.position().toPoint()
+        img_pos = self._widget_to_image(float(point.x()), float(point.y()))
+        if img_pos is None:
+            return
+        self._dragging = True
+        self._drag_start = img_pos
+        self._last_point = img_pos
+        x0, y0 = img_pos
+        self._current_poly = [
+            (_clamp(x0 / self._img_w, 0.0, 1.0), _clamp(y0 / self._img_h, 0.0, 1.0))
+        ]
+
+    def mouseMoveEvent(self, event: Any) -> None:  # noqa: ANN401
+        if not self._dragging or self._drag_start is None:
+            return
+        point = event.position().toPoint()
+        img_pos = self._widget_to_image(float(point.x()), float(point.y()))
+        if img_pos is None:
+            return
+        if self._last_point is not None:
+            dx = img_pos[0] - self._last_point[0]
+            dy = img_pos[1] - self._last_point[1]
+            if (dx * dx + dy * dy) < 9.0:
+                return
+        self._last_point = img_pos
+        x1, y1 = img_pos
+        self._current_poly.append(
+            (_clamp(x1 / self._img_w, 0.0, 1.0), _clamp(y1 / self._img_h, 0.0, 1.0))
+        )
+        self.update()
+
+    def mouseReleaseEvent(self, event: Any) -> None:  # noqa: ANN401
+        if event.button() != Qt.MouseButton.LeftButton:
+            return
+        self._dragging = False
+        self._drag_start = None
+        self._last_point = None
+        if len(self._current_poly) >= 3:
+            self._polys_norm.append(list(self._current_poly))
+        self._current_poly = []
+        self.update()
+
+
+class MaskEditorDialog(QDialog):
+    def __init__(
+        self,
+        frame: np.ndarray,
+        poly_norm: list[list[tuple[float, float]]] | list[tuple[float, float]] | None,
+        *,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Ustaw strefe niewidoczna dla AI")
+        self.editor = MaskEditorWidget(frame, poly_norm)
+        self.setMinimumSize(900, 520)
+        self.resize(1000, 640)
+        self.setWindowState(self.windowState() | Qt.WindowState.WindowFullScreen)
+
+        info = QLabel(
+            "Przytrzymaj LPM i rysuj ksztalt. Poza obrazem punkt przyciagnie sie do krawedzi. "
+            "Mozesz narysowac kilka ksztaltow."
+        )
+        info.setStyleSheet("color: #bfc9da;")
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel
+        )
+        back_btn = QPushButton("Cofnij")
+        buttons.addButton(back_btn, QDialogButtonBox.ButtonRole.ActionRole)
+        clear_btn = QPushButton("Wyczysc")
+        buttons.addButton(clear_btn, QDialogButtonBox.ButtonRole.ResetRole)
+
+        back_btn.clicked.connect(self.reject)
+        clear_btn.clicked.connect(self.editor.clear_rect)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(info)
+        layout.addWidget(self.editor, stretch=1)
+        layout.addWidget(buttons)
+
+    def get_rect(self) -> list[list[tuple[float, float]]]:
+        return self.editor.get_rect()
+
+
 class FullscreenVideoWindow(QWidget):
     request_close = pyqtSignal()
     zoom_delta = pyqtSignal(int)
@@ -751,6 +934,13 @@ class InferenceWindow(QMainWindow):
         self.config_path = Path(config_path).resolve()
         self.config = load_yaml(self.config_path)
 
+        self.app_root_dir = resolve_path("logs/app")
+        self.app_settings_dir = self.app_root_dir / "settings"
+        self.app_config_path = self.app_settings_dir / "config.yaml"
+        self._load_app_config_overlay()
+        self.sources_settings_path = self.app_settings_dir / "sources.yaml"
+        self.sources = self._load_sources_config()
+
         self.model_cfg = dict(self.config.get("model", {}) or {})
         self.inference_cfg = dict(self.config.get("inference", {}) or {})
         self.security_cfg = dict(self.config.get("security", {}) or {})
@@ -777,11 +967,6 @@ class InferenceWindow(QMainWindow):
         self.predict_kwargs: dict[str, Any] = {}
         self.compile_enabled = False
         self.compile_fallback_applied = False
-
-        self.app_root_dir = resolve_path("logs/app")
-        self.app_settings_dir = self.app_root_dir / "settings"
-        self.sources_settings_path = self.app_settings_dir / "sources.yaml"
-        self.sources = self._load_sources_config()
 
         self.runtimes: dict[str, SourceRuntime] = {}
         self.trackers: dict[str, Any] = {}
@@ -993,10 +1178,10 @@ class InferenceWindow(QMainWindow):
 
         self.main_tabs = QTabWidget()
         self.main_tabs.setTabPosition(QTabWidget.TabPosition.North)
-        self.main_tabs.addTab(self._build_settings_tab(), "Ustawienia")
-        self.main_tabs.addTab(self._build_camera_config_tab(), "Konfiguracja kamer")
         self.main_tabs.addTab(self._build_preview_tab(), "Podglad kamer")
+        self.main_tabs.addTab(self._build_camera_config_tab(), "Konfiguracja kamer")
         self.main_tabs.addTab(self._build_events_tab(), "Wykryty ruch")
+        self.main_tabs.addTab(self._build_settings_tab(), "Ustawienia")
         self.main_tabs.addTab(self._build_logs_tab(), "Logi")
         layout.addWidget(self.main_tabs)
 
@@ -1018,7 +1203,7 @@ class InferenceWindow(QMainWindow):
 
         self._set_controls_from_config()
         self._bind_setting_autosave()
-        self.main_tabs.setCurrentIndex(2)
+        self.main_tabs.setCurrentIndex(0)
         self.preview_tabs.setCurrentIndex(0)
         self._apply_theme()
         self._position_overlay_controls()
@@ -1071,7 +1256,7 @@ class InferenceWindow(QMainWindow):
             "}"
             "QTableWidget { gridline-color: #2e3644; }"
             "QTableWidget::item { background: #10151d; color: #dfe6f3; }"
-            "QTableWidget::item:selected { background: #2f81f7; color: #ffffff; }"
+            "QTableWidget::item:selected { background: #2b313a; color: #ffffff; }"
             "QPushButton {"
             "background: #2f81f7;"
             "color: white;"
@@ -1093,7 +1278,11 @@ class InferenceWindow(QMainWindow):
             "QHeaderView::section:vertical { background: #1d2430; color: #d2d9e6; }"
             "QTableCornerButton::section { background: #1d2430; border: 1px solid #313a4a; }"
             "QCheckBox::indicator { width: 16px; height: 16px; border: 1px solid #53647f; background: #0f1520; border-radius: 3px; }"
-            "QCheckBox::indicator:checked { background: #2f81f7; border: 1px solid #2f81f7; }"
+            "QCheckBox::indicator:checked {"
+            "background: #2aa96b;"
+            "border: 1px solid #1f8a55;"
+            "image: url(\"data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 10'><path fill='%23ffffff' d='M4.5 7.5L1.5 4.5L0 6L4.5 10.5L12 3L10.5 1.5z'/></svg>\");"
+            "}"
             "QScrollArea { background: #10141b; border: 1px solid #2a303c; }"
             "QScrollBar:vertical { background: #161c27; width: 12px; margin: 0px; border: 1px solid #2b3341; }"
             "QScrollBar::handle:vertical { background: #3a4659; min-height: 18px; border-radius: 5px; }"
@@ -1120,8 +1309,55 @@ class InferenceWindow(QMainWindow):
         content = QWidget()
         layout = QVBoxLayout(content)
         layout.setSpacing(10)
+        settings_box_style = (
+            "QGroupBox {"
+            "font-size: 16px;"
+            "font-weight: 700;"
+            "color: #e3e9f4;"
+            "border: 1px solid #2b3341;"
+            "border-radius: 8px;"
+            "margin-top: 14px;"
+            "}"
+            "QGroupBox::title {"
+            "subcontrol-origin: margin;"
+            "subcontrol-position: top left;"
+            "padding: 2px 10px;"
+            "background: #151a23;"
+            "border-radius: 6px;"
+            "}"
+        )
+
+        def _make_toggle_row(label: str) -> tuple[QWidget, QPushButton]:
+            btn = QPushButton("")
+            btn.setCheckable(True)
+            btn.setFixedSize(20, 20)
+            btn.setStyleSheet(
+                "QPushButton {"
+                "background: #1a202b;"
+                "border: 1px solid #3b4657;"
+                "border-radius: 4px;"
+                "color: #ffffff;"
+                "padding: 0px;"
+                "font-size: 14px;"
+                "font-weight: 800;"
+                "}"
+                "QPushButton:checked {"
+                "background: #2aa96b;"
+                "border: 1px solid #1f8a55;"
+                "}"
+            )
+            btn.toggled.connect(lambda checked, b=btn: b.setText("✓" if checked else ""))
+            row = QWidget()
+            row_layout = QHBoxLayout(row)
+            row_layout.setContentsMargins(0, 0, 0, 0)
+            row_layout.setSpacing(8)
+            row_layout.addWidget(btn)
+            row_layout.addWidget(QLabel(label))
+            row_layout.addStretch(1)
+            return row, btn
 
         security_box = QGroupBox("Reguly alarmu (dzien / noc)")
+        security_box.setStyleSheet(settings_box_style)
         security_grid = QGridLayout(security_box)
 
         self.security_mode_combo = QComboBox()
@@ -1151,6 +1387,7 @@ class InferenceWindow(QMainWindow):
         layout.addWidget(security_box)
 
         inference_box = QGroupBox("Parametry detekcji YOLO")
+        inference_box.setStyleSheet(settings_box_style)
         inference_grid = QGridLayout(inference_box)
 
         self.conf_spin = QDoubleSpinBox()
@@ -1171,9 +1408,9 @@ class InferenceWindow(QMainWindow):
         self.max_det_spin.setRange(1, 1000)
 
         self.device_edit = QLineEdit()
-        self.half_checkbox = QCheckBox("FP16 (half precision)")
-        self.compile_checkbox = QCheckBox("torch.compile (jesli stabilne)")
-        self.start_maximized_checkbox = QCheckBox("Start aplikacji w trybie zmaksymalizowanym")
+        half_row, self.half_checkbox = _make_toggle_row("FP16 (half precision)")
+        compile_row, self.compile_checkbox = _make_toggle_row("torch.compile (jesli stabilne)")
+        startmax_row, self.start_maximized_checkbox = _make_toggle_row("Start aplikacji w trybie zmaksymalizowanym")
 
         inference_grid.addWidget(QLabel("Prog pewnosci (conf):"), 0, 0)
         inference_grid.addWidget(self.conf_spin, 0, 1)
@@ -1185,16 +1422,19 @@ class InferenceWindow(QMainWindow):
         inference_grid.addWidget(self.max_det_spin, 3, 1)
         inference_grid.addWidget(QLabel("Urzadzenie (np. 0/cpu):"), 4, 0)
         inference_grid.addWidget(self.device_edit, 4, 1)
-        inference_grid.addWidget(self.half_checkbox, 5, 0, 1, 2)
-        inference_grid.addWidget(self.compile_checkbox, 6, 0, 1, 2)
-        inference_grid.addWidget(self.start_maximized_checkbox, 7, 0, 1, 2)
+        inference_grid.addWidget(half_row, 5, 0, 1, 2)
+        inference_grid.addWidget(compile_row, 6, 0, 1, 2)
+        inference_grid.addWidget(startmax_row, 7, 0, 1, 2)
 
         layout.addWidget(inference_box)
 
         events_box = QGroupBox("Archiwizacja zdarzen")
+        events_box.setStyleSheet(settings_box_style)
         events_grid = QGridLayout(events_box)
 
-        self.events_enabled_checkbox = QCheckBox("Zapisz klip wideo, gdy osoba jest widoczna dluzej niz prog")
+        events_enabled_row, self.events_enabled_checkbox = _make_toggle_row(
+            "Zapisz klip wideo, gdy osoba jest widoczna dluzej niz prog"
+        )
         self.events_min_visible_spin = QDoubleSpinBox()
         self.events_min_visible_spin.setRange(0.3, 120.0)
         self.events_min_visible_spin.setSingleStep(0.2)
@@ -1217,8 +1457,12 @@ class InferenceWindow(QMainWindow):
         self.events_max_saved_spin.setRange(0, 20000)
         self.events_max_saved_spin.setSpecialValueText("0 (bez limitu)")
 
-        self.events_save_annotated_checkbox = QCheckBox("Zapisuj klip z boxami i opisem")
-        self.events_once_per_streak_checkbox = QCheckBox("Tylko jeden zapis na ciagla sekwencje wykrycia")
+        save_annotated_row, self.events_save_annotated_checkbox = _make_toggle_row(
+            "Zapisuj klip z boxami i opisem"
+        )
+        once_row, self.events_once_per_streak_checkbox = _make_toggle_row(
+            "Tylko jeden zapis na ciagla sekwencje wykrycia"
+        )
 
         self.events_output_dir_edit = QLineEdit()
         self.events_output_dir_edit.setPlaceholderText("logs/app/events")
@@ -1231,7 +1475,7 @@ class InferenceWindow(QMainWindow):
         output_row_widget = QWidget()
         output_row_widget.setLayout(output_row)
 
-        events_grid.addWidget(self.events_enabled_checkbox, 0, 0, 1, 2)
+        events_grid.addWidget(events_enabled_row, 0, 0, 1, 2)
         events_grid.addWidget(QLabel("Minimalny czas widocznosci (s):"), 1, 0)
         events_grid.addWidget(self.events_min_visible_spin, 1, 1)
         events_grid.addWidget(QLabel("Cooldown miedzy zapisami (s):"), 2, 0)
@@ -1242,14 +1486,15 @@ class InferenceWindow(QMainWindow):
         events_grid.addWidget(self.events_min_person_spin, 4, 1)
         events_grid.addWidget(QLabel("Maks. liczba zapisanych zdarzen:"), 5, 0)
         events_grid.addWidget(self.events_max_saved_spin, 5, 1)
-        events_grid.addWidget(self.events_save_annotated_checkbox, 6, 0, 1, 2)
-        events_grid.addWidget(self.events_once_per_streak_checkbox, 7, 0, 1, 2)
+        events_grid.addWidget(save_annotated_row, 6, 0, 1, 2)
+        events_grid.addWidget(once_row, 7, 0, 1, 2)
         events_grid.addWidget(QLabel("Folder zapisu zdarzen:"), 8, 0)
         events_grid.addWidget(output_row_widget, 8, 1)
 
         layout.addWidget(events_box)
 
         model_box = QGroupBox("Wybor modelu")
+        model_box.setStyleSheet(settings_box_style)
         model_layout = QVBoxLayout(model_box)
 
         self.current_model_label = QLabel("Aktualny model: -")
@@ -1266,8 +1511,20 @@ class InferenceWindow(QMainWindow):
         self.model_help_label.setStyleSheet("color: #9fb0c9;")
         model_layout.addWidget(self.model_help_label)
 
-        self.model_table = QTableWidget(0, 7)
-        self.model_table.setHorizontalHeaderLabels(["Model", "Zrodlo", "Arch", "mAP50", "mAP50-95", "Run", "Path"])
+        self.model_table = QTableWidget(0, 9)
+        self.model_table.setHorizontalHeaderLabels(
+            [
+                "Dostepny",
+                "Model",
+                "Zrodlo",
+                "Arch",
+                "mAP50",
+                "mAP50-95",
+                "Size(MB)",
+                "Run",
+                "Path",
+            ]
+        )
         self.model_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.model_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.model_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
@@ -1281,16 +1538,21 @@ class InferenceWindow(QMainWindow):
         header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(6, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(6, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(7, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(8, QHeaderView.ResizeMode.Stretch)
 
         model_layout.addWidget(self.model_table)
 
         model_buttons = QHBoxLayout()
         refresh_models_btn = QPushButton("Odswiez liste modeli")
         refresh_models_btn.clicked.connect(self._refresh_model_catalog)
+        download_model_btn = QPushButton("Pobierz wybrany model")
+        download_model_btn.clicked.connect(self._download_selected_model)
         apply_model_btn = QPushButton("Zaladuj wybrany model")
         apply_model_btn.clicked.connect(self._apply_selected_model)
         model_buttons.addWidget(refresh_models_btn)
+        model_buttons.addWidget(download_model_btn)
         model_buttons.addWidget(apply_model_btn)
         model_layout.addLayout(model_buttons)
 
@@ -1312,19 +1574,47 @@ class InferenceWindow(QMainWindow):
 
         table_box = QGroupBox("Sources")
         table_layout = QVBoxLayout(table_box)
+        table_box.setStyleSheet(
+            "QGroupBox {"
+            "font-size: 16px;"
+            "font-weight: 700;"
+            "color: #e3e9f4;"
+            "border: 1px solid #2b3341;"
+            "border-radius: 8px;"
+            "margin-top: 14px;"
+            "}"
+            "QGroupBox::title {"
+            "subcontrol-origin: margin;"
+            "subcontrol-position: top left;"
+            "padding: 2px 10px;"
+            "background: #151a23;"
+            "border-radius: 6px;"
+            "}"
+        )
 
-        self.source_table = QTableWidget(0, 4)
-        self.source_table.setHorizontalHeaderLabels(["Name", "Type", "Value", "Enabled"])
+        self.source_table = QTableWidget(0, 6)
+        self.source_table.setHorizontalHeaderLabels(["Name", "Type", "Value", "Mask", "Random", "Enabled"])
         self.source_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.source_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.source_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.source_table.verticalHeader().setVisible(False)
+        self.source_table.verticalHeader().setDefaultSectionSize(30)
+        self.source_table.setStyleSheet(
+            "QTableWidget { font-size: 12px; }"
+            "QHeaderView::section {"
+            "font-size: 13px;"
+            "font-weight: 600;"
+            "padding: 6px;"
+            "}"
+        )
 
         header = self.source_table.horizontalHeader()
         header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
         header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents)
 
         self.source_table.itemChanged.connect(self._on_source_item_changed)
         table_layout.addWidget(self.source_table)
@@ -1332,19 +1622,59 @@ class InferenceWindow(QMainWindow):
         source_buttons = QHBoxLayout()
         remove_source_btn = QPushButton("Remove selected source")
         remove_source_btn.clicked.connect(self._remove_selected_source)
+        edit_mask_btn = QPushButton("Edit mask")
+        edit_mask_btn.clicked.connect(self._open_source_mask_editor)
         save_source_btn = QPushButton("Save camera config")
         save_source_btn.clicked.connect(lambda: self._persist_config(show_message=True))
         source_buttons.addWidget(remove_source_btn)
+        source_buttons.addWidget(edit_mask_btn)
         source_buttons.addWidget(save_source_btn)
         table_layout.addLayout(source_buttons)
 
         layout.addWidget(table_box)
 
-        self.source_toolbox = QToolBox()
-        self.source_toolbox.addItem(self._build_add_camera_page(), "Add camera")
-        self.source_toolbox.addItem(self._build_add_video_page(), "Add video source")
-        self.source_toolbox.addItem(self._build_add_stream_page(), "Add stream source")
-        layout.addWidget(self.source_toolbox)
+        add_box = QGroupBox("Dodaj zrodlo")
+        add_layout = QVBoxLayout(add_box)
+        add_box.setStyleSheet(
+            "QGroupBox {"
+            "font-size: 16px;"
+            "font-weight: 700;"
+            "color: #e3e9f4;"
+            "border: 1px solid #2b3341;"
+            "border-radius: 8px;"
+            "margin-top: 14px;"
+            "}"
+            "QGroupBox::title {"
+            "subcontrol-origin: margin;"
+            "subcontrol-position: top left;"
+            "padding: 2px 10px;"
+            "background: #151a23;"
+            "border-radius: 6px;"
+            "}"
+        )
+
+        selector_row = QHBoxLayout()
+        selector_label = QLabel("Typ zrodla:")
+        self.source_type_combo = QComboBox()
+        self.source_type_combo.addItems(
+            [
+                "Kamera",
+                "Plik wideo",
+                "Strumien (RTSP/HTTP)",
+            ]
+        )
+        selector_row.addWidget(selector_label)
+        selector_row.addWidget(self.source_type_combo, stretch=1)
+        add_layout.addLayout(selector_row)
+
+        self.source_add_stack = QStackedWidget()
+        self.source_add_stack.addWidget(self._build_add_camera_page())
+        self.source_add_stack.addWidget(self._build_add_video_page())
+        self.source_add_stack.addWidget(self._build_add_stream_page())
+        add_layout.addWidget(self.source_add_stack)
+
+        self.source_type_combo.currentIndexChanged.connect(self.source_add_stack.setCurrentIndex)
+        layout.addWidget(add_box)
 
         layout.addStretch(1)
         return page
@@ -1384,6 +1714,7 @@ class InferenceWindow(QMainWindow):
         row = QHBoxLayout()
         self.video_path_edit = QLineEdit()
         self.video_path_edit.setPlaceholderText("Path to file")
+        self.video_path_edit.textChanged.connect(self._update_video_duplicate_hint)
         browse_btn = QPushButton("Browse")
         browse_btn.clicked.connect(self._browse_video_file)
         row.addWidget(self.video_path_edit, stretch=1)
@@ -1393,6 +1724,14 @@ class InferenceWindow(QMainWindow):
         self.video_name_edit = QLineEdit()
         self.video_name_edit.setPlaceholderText("Name (optional)")
         layout.addWidget(self.video_name_edit)
+
+        self.video_random_start_checkbox = QCheckBox("Startuj od losowego momentu")
+        layout.addWidget(self.video_random_start_checkbox)
+
+        self.video_duplicate_label = QLabel("")
+        self.video_duplicate_label.setStyleSheet("color: #f0b429;")
+        self.video_duplicate_label.setVisible(False)
+        layout.addWidget(self.video_duplicate_label)
 
         add_btn = QPushButton("Add video source")
         add_btn.clicked.connect(self._add_video_source)
@@ -1861,6 +2200,40 @@ class InferenceWindow(QMainWindow):
                 if meta_run:
                     run_name = meta_run
 
+            size_mb: float | None = None
+            try:
+                size_mb = path.stat().st_size / (1024 * 1024)
+            except Exception:  # noqa: BLE001
+                size_mb = None
+
+            params_m = None
+            gflops = None
+            task = None
+            nc = None
+            if isinstance(meta, dict):
+                for key in ("params_m", "params"):
+                    if key in meta and meta.get(key) is not None:
+                        try:
+                            params_m = float(meta[key])
+                        except Exception:  # noqa: BLE001
+                            params_m = None
+                        break
+                for key in ("gflops", "flops"):
+                    if key in meta and meta.get(key) is not None:
+                        try:
+                            gflops = float(meta[key])
+                        except Exception:  # noqa: BLE001
+                            gflops = None
+                        break
+                task = str(meta.get("task", "")).strip() or None
+                if meta.get("nc") is not None:
+                    try:
+                        nc = int(meta.get("nc"))
+                    except Exception:  # noqa: BLE001
+                        nc = None
+                elif isinstance(meta.get("classes"), list):
+                    nc = len(meta.get("classes"))
+
             model_name = str(meta.get("model_name", path.name)).strip() if isinstance(meta, dict) else path.name
             family = _infer_model_family(model_name if model_name else path.name)
             if path.name in {"best.pt", "last.pt"} and model_name:
@@ -1880,6 +2253,56 @@ class InferenceWindow(QMainWindow):
                     "map5095": map5095,
                     "run": run_name or "-",
                     "model_name": model_name or path.name,
+                    "params_m": params_m,
+                    "gflops": gflops,
+                    "size_mb": size_mb,
+                    "task": task,
+                    "nc": nc,
+                    "missing": False,
+                }
+            )
+
+        suggested_names = [
+            "yolo26n.pt",
+            "yolo26s.pt",
+            "yolo26m.pt",
+            "yolo26l.pt",
+            "yolo26x.pt",
+            "yolov8n.pt",
+            "yolov8s.pt",
+            "yolov8m.pt",
+            "yolov8l.pt",
+            "yolov8x.pt",
+            "yolov5n.pt",
+            "yolov5s.pt",
+            "yolov5m.pt",
+            "yolov5l.pt",
+            "yolov5x.pt",
+        ]
+        existing_names = {entry["name"] for entry in entries}
+        for model_name in suggested_names:
+            if model_name in existing_names:
+                continue
+            missing_path = (local_weights_dir / model_name).resolve()
+            family = _infer_model_family(model_name)
+            entries.append(
+                {
+                    "name": model_name,
+                    "display_name": model_name,
+                    "kind": "base",
+                    "family": family,
+                    "path": missing_path,
+                    "path_display": _to_relative_or_abs(missing_path),
+                    "map50": None,
+                    "map5095": None,
+                    "run": "-",
+                    "model_name": model_name,
+                    "params_m": None,
+                    "gflops": None,
+                    "size_mb": None,
+                    "task": None,
+                    "nc": None,
+                    "missing": True,
                 }
             )
 
@@ -1927,14 +2350,20 @@ class InferenceWindow(QMainWindow):
         for row, entry in enumerate(self.model_catalog):
             map50 = entry["map50"]
             map5095 = entry["map5095"]
+            size_mb = entry.get("size_mb")
 
-            self.model_table.setItem(row, 0, QTableWidgetItem(str(entry["display_name"])))
-            self.model_table.setItem(row, 1, QTableWidgetItem(str(entry["kind"])))
-            self.model_table.setItem(row, 2, QTableWidgetItem(str(entry["family"])))
-            self.model_table.setItem(row, 3, QTableWidgetItem("-" if map50 is None else f"{map50:.4f}"))
-            self.model_table.setItem(row, 4, QTableWidgetItem("-" if map5095 is None else f"{map5095:.4f}"))
-            self.model_table.setItem(row, 5, QTableWidgetItem(str(entry["run"])))
-            self.model_table.setItem(row, 6, QTableWidgetItem(str(entry["path_display"])))
+            available = "✓" if not entry.get("missing", False) else "✗"
+            available_item = QTableWidgetItem(available)
+            available_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.model_table.setItem(row, 0, available_item)
+            self.model_table.setItem(row, 1, QTableWidgetItem(str(entry["display_name"])))
+            self.model_table.setItem(row, 2, QTableWidgetItem(str(entry["kind"])))
+            self.model_table.setItem(row, 3, QTableWidgetItem(str(entry["family"])))
+            self.model_table.setItem(row, 4, QTableWidgetItem("-" if map50 is None else f"{map50:.4f}"))
+            self.model_table.setItem(row, 5, QTableWidgetItem("-" if map5095 is None else f"{map5095:.4f}"))
+            self.model_table.setItem(row, 6, QTableWidgetItem("-" if size_mb is None else f"{size_mb:.1f}"))
+            self.model_table.setItem(row, 7, QTableWidgetItem(str(entry["run"])))
+            self.model_table.setItem(row, 8, QTableWidgetItem(str(entry["path_display"])))
 
             if current_path_str and str(entry["path"]) == current_path_str:
                 selected_row = row
@@ -1952,25 +2381,45 @@ class InferenceWindow(QMainWindow):
 
         entry = self.model_catalog[row]
         model_path = Path(entry["path"]).resolve()
-        if not model_path.exists():
-            QMessageBox.warning(self, "Model", f"Sciezka modelu nie istnieje:\n{model_path}")
-            return
+        missing = bool(entry.get("missing", False)) or not model_path.exists()
+        if missing:
+            reply = QMessageBox.question(
+                self,
+                "Model",
+                f"Model {entry.get('model_name', entry.get('name'))} nie istnieje lokalnie. Pobierac teraz?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
 
         was_running = self.live_running
         if was_running:
             self.stop_live()
 
         try:
-            self.model = YOLO(str(model_path))
+            if missing:
+                self.model_cfg["name"] = str(entry.get("model_name", entry.get("name", ""))).strip() or self.model_cfg.get(
+                    "name", ""
+                )
+                self.model_cfg["selected_model_path"] = ""
+                self.model, reference = load_yolo_model(self.model_cfg, base_dir=Path.cwd())
+                model_path = Path(reference) if reference and Path(reference).exists() else model_path
+            else:
+                self.model = YOLO(str(model_path))
         except Exception as exc:  # noqa: BLE001
             QMessageBox.critical(self, "Model", f"Nie mozna zaladowac modelu:\n{exc}")
             if was_running:
                 self.start_live()
             return
 
-        self.current_model_path = model_path
-        self.model_reference = str(model_path)
-        self.model_cfg["selected_model_path"] = _to_relative_or_abs(model_path)
+        if model_path.exists():
+            self.current_model_path = model_path
+            self.model_reference = str(model_path)
+            self.model_cfg["selected_model_path"] = _to_relative_or_abs(model_path)
+        else:
+            self.current_model_path = None
+            self.model_reference = str(entry.get("model_name", model_path.name))
         selected_model_name = str(entry.get("model_name", "")).strip()
         if selected_model_name.lower().endswith(".pt"):
             self.model_cfg["name"] = selected_model_name
@@ -1984,6 +2433,40 @@ class InferenceWindow(QMainWindow):
 
         if was_running:
             self.start_live()
+
+    def _download_selected_model(self) -> None:
+        row = self.model_table.currentRow()
+        if row < 0 or row >= len(self.model_catalog):
+            QMessageBox.information(self, "Model", "Najpierw wybierz wiersz modelu.")
+            return
+
+        entry = self.model_catalog[row]
+        model_name = str(entry.get("model_name", entry.get("name", ""))).strip()
+        model_path = Path(entry["path"]).resolve()
+        if model_path.exists() and not entry.get("missing", False):
+            QMessageBox.information(self, "Model", "Model jest juz pobrany.")
+            return
+
+        reply = QMessageBox.question(
+            self,
+            "Model",
+            f"Pobrac model {model_name}?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        try:
+            self.model_cfg["name"] = model_name or self.model_cfg.get("name", "")
+            self.model_cfg["selected_model_path"] = ""
+            model, _reference = load_yolo_model(self.model_cfg, base_dir=Path.cwd())
+            del model
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.critical(self, "Model", f"Nie mozna pobrac modelu:\n{exc}")
+            return
+
+        self._refresh_model_catalog()
 
     # ---------- sources ----------
     def _normalize_sources_entries(self, raw_sources: Any) -> list[dict[str, Any]]:
@@ -2019,6 +2502,60 @@ class InferenceWindow(QMainWindow):
                     "enabled": bool(item.get("enabled", True)),
                 }
             )
+            if bool(item.get("random_start", False)):
+                normalized[-1]["random_start"] = True
+
+            ignore_polys: list[list[tuple[float, float]]] = []
+            raw_polys = item.get("ignore_polys")
+            if isinstance(raw_polys, list):
+                for poly in raw_polys:
+                    if not isinstance(poly, list):
+                        continue
+                    points: list[tuple[float, float]] = []
+                    for pt in poly:
+                        if isinstance(pt, (list, tuple)) and len(pt) == 2:
+                            try:
+                                x = float(pt[0])
+                                y = float(pt[1])
+                            except Exception:  # noqa: BLE001
+                                continue
+                            points.append((_clamp(x, 0.0, 1.0), _clamp(y, 0.0, 1.0)))
+                    if len(points) >= 3:
+                        ignore_polys.append(points)
+
+            if not ignore_polys:
+                raw_poly = item.get("ignore_poly")
+                if isinstance(raw_poly, list):
+                    points = []
+                    for pt in raw_poly:
+                        if isinstance(pt, (list, tuple)) and len(pt) == 2:
+                            try:
+                                x = float(pt[0])
+                                y = float(pt[1])
+                            except Exception:  # noqa: BLE001
+                                continue
+                            points.append((_clamp(x, 0.0, 1.0), _clamp(y, 0.0, 1.0)))
+                    if len(points) >= 3:
+                        ignore_polys.append(points)
+
+            if not ignore_polys:
+                rect = item.get("ignore_rect")
+                if isinstance(rect, (list, tuple)) and len(rect) == 4:
+                    try:
+                        x0, y0, x1, y1 = [float(v) for v in rect]
+                        ignore_polys.append(
+                            [
+                                (_clamp(x0, 0.0, 1.0), _clamp(y0, 0.0, 1.0)),
+                                (_clamp(x1, 0.0, 1.0), _clamp(y0, 0.0, 1.0)),
+                                (_clamp(x1, 0.0, 1.0), _clamp(y1, 0.0, 1.0)),
+                                (_clamp(x0, 0.0, 1.0), _clamp(y1, 0.0, 1.0)),
+                            ]
+                        )
+                    except Exception:  # noqa: BLE001
+                        ignore_polys = []
+
+            if ignore_polys:
+                normalized[-1]["ignore_polys"] = ignore_polys
 
         return normalized
 
@@ -2045,11 +2582,44 @@ class InferenceWindow(QMainWindow):
         }
         save_yaml(self.sources_settings_path, payload)
 
+    def _load_app_config_overlay(self) -> None:
+        if not self.app_config_path.exists():
+            return
+        try:
+            overlay = load_yaml(self.app_config_path)
+        except Exception:  # noqa: BLE001
+            overlay = {}
+        if not isinstance(overlay, dict):
+            return
+        for key in ("model", "inference", "tracker", "security", "events", "runtime"):
+            if key in overlay:
+                self.config[key] = overlay.get(key)
+
     def _refresh_camera_list(self) -> None:
         max_index = int(self.runtime_cfg.get("scan_max_index", 8))
         self.camera_combo.clear()
-        for camera_index in scan_available_cameras(max_index=max_index):
-            self.camera_combo.addItem(f"Camera {camera_index}", camera_index)
+        available = list(scan_available_cameras(max_index=max_index))
+        if not available:
+            self.camera_combo.addItem("Brak dostepnych kamer", -1)
+            model = self.camera_combo.model()
+            item = model.item(0) if model is not None else None
+            if item is not None:
+                item.setEnabled(False)
+            return
+
+        existing = self._existing_source_values("camera")
+        for camera_index in available:
+            label = f"Kamera {camera_index}"
+            already_added = str(camera_index) in existing
+            if already_added:
+                label = f"{label} (juz dodana)"
+            self.camera_combo.addItem(label, camera_index)
+            if already_added:
+                row = self.camera_combo.count() - 1
+                model = self.camera_combo.model()
+                item = model.item(row) if model is not None else None
+                if item is not None:
+                    item.setEnabled(False)
 
     def _browse_video_file(self) -> None:
         file_path, _ = QFileDialog.getOpenFileName(
@@ -2060,6 +2630,7 @@ class InferenceWindow(QMainWindow):
         )
         if file_path:
             self.video_path_edit.setText(file_path)
+            self._update_video_duplicate_hint()
 
     def _browse_events_output_dir(self) -> None:
         selected_dir = QFileDialog.getExistingDirectory(
@@ -2073,7 +2644,34 @@ class InferenceWindow(QMainWindow):
     def _existing_source_names(self) -> set[str]:
         return {str(source.get("name", "")) for source in self.sources}
 
-    def _add_source(self, source_type: str, value: Any, name_hint: str) -> None:
+    def _existing_source_values(self, source_type: str) -> set[str]:
+        values: set[str] = set()
+        for source in self.sources:
+            if str(source.get("type", "")) == source_type:
+                values.add(self._normalize_source_value(source_type, source.get("value", "")))
+        return values
+
+    def _normalize_source_value(self, source_type: str, value: Any) -> str:
+        raw = str(value or "")
+        if source_type == "video":
+            try:
+                return os.path.normcase(str(Path(raw).resolve()))
+            except Exception:  # noqa: BLE001
+                return os.path.normcase(raw)
+        if source_type == "stream":
+            return raw.strip()
+        if source_type == "camera":
+            return str(raw).strip()
+        return raw
+
+    def _add_source(
+        self,
+        source_type: str,
+        value: Any,
+        name_hint: str,
+        *,
+        extra: dict[str, Any] | None = None,
+    ) -> None:
         source_name = _ensure_unique_name(self._existing_source_names(), _safe_name(name_hint, f"{source_type}_source"))
         source = {
             "name": source_name,
@@ -2081,6 +2679,8 @@ class InferenceWindow(QMainWindow):
             "value": value,
             "enabled": True,
         }
+        if extra:
+            source.update(extra)
         self.sources.append(source)
         self._sync_runtimes_with_sources()
         self._rebuild_source_table()
@@ -2099,6 +2699,9 @@ class InferenceWindow(QMainWindow):
             return
 
         camera_index = int(camera_data)
+        if self._normalize_source_value("camera", camera_index) in self._existing_source_values("camera"):
+            QMessageBox.information(self, "Camera", "Ta kamera jest juz dodana.")
+            return
         base_name = self.camera_name_edit.text().strip() or f"camera_{camera_index}"
         self._add_source("camera", camera_index, base_name)
         self.camera_name_edit.clear()
@@ -2114,9 +2717,27 @@ class InferenceWindow(QMainWindow):
             QMessageBox.warning(self, "Video", f"File does not exist:\n{video_path}")
             return
 
+        duplicate = self._normalize_source_value("video", video_path) in self._existing_source_values("video")
+        if duplicate:
+            reply = QMessageBox.question(
+                self,
+                "Video",
+                "To zrodlo wideo jest juz dodane. Czy na pewno chcesz dodac duplikat?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+
         base_name = self.video_name_edit.text().strip() or video_path.stem
-        self._add_source("video", str(video_path), base_name)
+        extra: dict[str, Any] = {}
+        if hasattr(self, "video_random_start_checkbox") and self.video_random_start_checkbox.isChecked():
+            extra["random_start"] = True
+        self._add_source("video", str(video_path), base_name, extra=extra or None)
         self.video_name_edit.clear()
+        if hasattr(self, "video_random_start_checkbox"):
+            self.video_random_start_checkbox.setChecked(False)
+        self._update_video_duplicate_hint()
 
     def _add_stream_source(self) -> None:
         stream_url = self.stream_url_edit.text().strip()
@@ -2124,9 +2745,103 @@ class InferenceWindow(QMainWindow):
             QMessageBox.warning(self, "Stream", "Provide stream URL first.")
             return
 
+        if self._normalize_source_value("stream", stream_url) in self._existing_source_values("stream"):
+            QMessageBox.information(self, "Stream", "To zrodlo strumienia jest juz dodane.")
+            return
+
         base_name = self.stream_name_edit.text().strip() or "stream_source"
         self._add_source("stream", stream_url, base_name)
         self.stream_name_edit.clear()
+
+    def _get_source_by_name(self, source_name: str) -> dict[str, Any] | None:
+        for source in self.sources:
+            if str(source.get("name", "")) == source_name:
+                return source
+        return None
+
+    def _update_video_duplicate_hint(self) -> None:
+        if not hasattr(self, "video_duplicate_label"):
+            return
+        raw_path = self.video_path_edit.text().strip() if hasattr(self, "video_path_edit") else ""
+        if not raw_path:
+            self.video_duplicate_label.setVisible(False)
+            self.video_duplicate_label.setText("")
+            return
+        video_path = resolve_path(raw_path)
+        duplicate = self._normalize_source_value("video", video_path) in self._existing_source_values("video")
+        if duplicate:
+            self.video_duplicate_label.setText("To wideo jest juz dodane.")
+            self.video_duplicate_label.setVisible(True)
+        else:
+            self.video_duplicate_label.setVisible(False)
+            self.video_duplicate_label.setText("")
+
+    def _apply_ignore_rect(self, frame: np.ndarray, rect: tuple[float, float, float, float]) -> None:
+        if frame is None:
+            return
+        h, w = frame.shape[:2]
+        x0, y0, x1, y1 = rect
+        left = int(_clamp(x0, 0.0, 1.0) * w)
+        right = int(_clamp(x1, 0.0, 1.0) * w)
+        top = int(_clamp(y0, 0.0, 1.0) * h)
+        bottom = int(_clamp(y1, 0.0, 1.0) * h)
+        if right <= left or bottom <= top:
+            return
+        frame[top:bottom, left:right] = 0
+
+    def _apply_ignore_poly(self, frame: np.ndarray, poly: list[tuple[float, float]]) -> None:
+        if frame is None or not poly:
+            return
+        h, w = frame.shape[:2]
+        pts = []
+        for x, y in poly:
+            pts.append([int(_clamp(x, 0.0, 1.0) * w), int(_clamp(y, 0.0, 1.0) * h)])
+        if len(pts) < 3:
+            return
+        contour = np.array(pts, dtype=np.int32).reshape((-1, 1, 2))
+        cv2.fillPoly(frame, [contour], (0, 0, 0))
+
+    def _apply_ignore_polys(self, frame: np.ndarray, polys: list[list[tuple[float, float]]]) -> None:
+        if frame is None or not polys:
+            return
+        for poly in polys:
+            self._apply_ignore_poly(frame, poly)
+
+    def _open_source_mask_editor(self) -> None:
+        row = self.source_table.currentRow()
+        if row < 0 or row >= len(self.sources):
+            QMessageBox.information(self, "Mask", "Wybierz zrodlo w tabeli.")
+            return
+
+        source = self.sources[row]
+        source_name = str(source.get("name", "source"))
+        runtime = self.runtimes.get(source_name)
+        if runtime is None or runtime.last_input is None:
+            QMessageBox.information(self, "Mask", "Brak klatki do edycji. Uruchom podglad zrodla.")
+            return
+
+        poly_norm = source.get("ignore_polys")
+        if not poly_norm:
+            legacy_poly = source.get("ignore_poly")
+            if legacy_poly:
+                poly_norm = [legacy_poly]
+        rect = source.get("ignore_rect")
+        if rect and not poly_norm:
+            x0, y0, x1, y1 = rect
+            poly_norm = [[(x0, y0), (x1, y0), (x1, y1), (x0, y1)]]
+
+        dialog = MaskEditorDialog(runtime.last_input, poly_norm, parent=self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        new_poly = dialog.get_rect()
+        if not new_poly:
+            source.pop("ignore_polys", None)
+        else:
+            source["ignore_polys"] = new_poly
+        source.pop("ignore_poly", None)
+        source.pop("ignore_rect", None)
+        self._persist_config(show_message=False)
+        self._rebuild_source_table()
 
     def _remove_selected_source(self) -> None:
         row = self.source_table.currentRow()
@@ -2194,19 +2909,82 @@ class InferenceWindow(QMainWindow):
                 source_type = str(source.get("type", "video"))
                 value = str(source.get("value", ""))
                 enabled = bool(source.get("enabled", True))
+                masks = source.get("ignore_polys") or source.get("ignore_poly") or source.get("ignore_rect")
+                mask_count = 0
+                if isinstance(masks, list):
+                    if masks and isinstance(masks[0], (list, tuple)) and len(masks) > 0:
+                        first = masks[0]
+                        if first and isinstance(first, (list, tuple)) and len(first) == 2:
+                            mask_count = 1
+                        else:
+                            mask_count = len(masks)
+                elif masks:
+                    mask_count = 1
 
                 self.source_table.setItem(row, 0, QTableWidgetItem(name))
                 self.source_table.setItem(row, 1, QTableWidgetItem(source_type))
                 self.source_table.setItem(row, 2, QTableWidgetItem(value))
+                mask_label = "tak" if mask_count > 0 else "nie"
+                if mask_count > 1:
+                    mask_label = f"tak ({mask_count})"
+                self.source_table.setItem(row, 3, QTableWidgetItem(mask_label))
 
-                enabled_item = QTableWidgetItem("yes" if enabled else "no")
-                enabled_item.setFlags(
-                    Qt.ItemFlag.ItemIsEnabled
-                    | Qt.ItemFlag.ItemIsSelectable
-                    | Qt.ItemFlag.ItemIsUserCheckable
+                random_enabled = bool(source.get("random_start", False)) if source_type == "video" else False
+                if source_type == "video":
+                    random_checkbox = QPushButton("✓" if random_enabled else "")
+                    random_checkbox.setCheckable(True)
+                    random_checkbox.setChecked(random_enabled)
+                    random_checkbox.setFixedSize(22, 22)
+                    random_checkbox.setStyleSheet(
+                        "QPushButton {"
+                        "background: #1a202b;"
+                        "border: 1px solid #3b4657;"
+                        "border-radius: 4px;"
+                        "color: #ffffff;"
+                        "padding: 0px;"
+                        "font-size: 14px;"
+                        "font-weight: 800;"
+                        "}"
+                        "QPushButton:checked { background: #2f81f7; border: 1px solid #2363c0; }"
+                    )
+                    random_checkbox.toggled.connect(lambda checked, b=random_checkbox: b.setText("✓" if checked else ""))
+                    random_checkbox.toggled.connect(lambda checked, r=row: self._on_source_random_toggled(r, checked))
+                    random_cell = QWidget()
+                    random_layout = QHBoxLayout(random_cell)
+                    random_layout.setContentsMargins(0, 0, 0, 0)
+                    random_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                    random_layout.addWidget(random_checkbox)
+                    self.source_table.setCellWidget(row, 4, random_cell)
+                else:
+                    item = QTableWidgetItem("-")
+                    item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
+                    item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                    self.source_table.setItem(row, 4, item)
+
+                enabled_checkbox = QPushButton("✓" if enabled else "")
+                enabled_checkbox.setCheckable(True)
+                enabled_checkbox.setChecked(enabled)
+                enabled_checkbox.setFixedSize(22, 22)
+                enabled_checkbox.setStyleSheet(
+                    "QPushButton {"
+                    "background: #1a202b;"
+                    "border: 1px solid #3b4657;"
+                    "border-radius: 4px;"
+                    "color: #ffffff;"
+                    "padding: 0px;"
+                    "font-size: 14px;"
+                    "font-weight: 800;"
+                    "}"
+                    "QPushButton:checked { background: #2aa96b; border: 1px solid #1f8a55; }"
                 )
-                enabled_item.setCheckState(Qt.CheckState.Checked if enabled else Qt.CheckState.Unchecked)
-                self.source_table.setItem(row, 3, enabled_item)
+                enabled_checkbox.toggled.connect(lambda checked, b=enabled_checkbox: b.setText("✓" if checked else ""))
+                enabled_checkbox.toggled.connect(lambda checked, r=row: self._on_source_enabled_toggled(r, checked))
+                cell = QWidget()
+                cell_layout = QHBoxLayout(cell)
+                cell_layout.setContentsMargins(0, 0, 0, 0)
+                cell_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                cell_layout.addWidget(enabled_checkbox)
+                self.source_table.setCellWidget(row, 5, cell)
         finally:
             self._table_updating = False
 
@@ -2239,6 +3017,45 @@ class InferenceWindow(QMainWindow):
                 self.focused_source = None
 
         self._rebuild_live_layout()
+        self._persist_config(show_message=False)
+
+    def _on_source_enabled_toggled(self, row: int, enabled: bool) -> None:
+        if self._table_updating:
+            return
+        if row < 0 or row >= len(self.sources):
+            return
+        self.sources[row]["enabled"] = enabled
+
+        source_name = str(self.sources[row].get("name", ""))
+        if not enabled:
+            runtime = self.runtimes.get(source_name)
+            if runtime is not None:
+                self._finalize_event_clip(source_name, runtime, time.perf_counter())
+                runtime.release()
+            self._clear_async_state_for_source(source_name)
+            with self._infer_lock:
+                self.trackers.pop(source_name, None)
+            if self.focused_source == source_name:
+                self._close_fullscreen_source()
+                self.focused_source = None
+
+        self._rebuild_live_layout()
+        self._persist_config(show_message=False)
+
+    def _on_source_random_toggled(self, row: int, enabled: bool) -> None:
+        if self._table_updating:
+            return
+        if row < 0 or row >= len(self.sources):
+            return
+        if str(self.sources[row].get("type", "")) != "video":
+            return
+        self.sources[row]["random_start"] = enabled
+
+        source_name = str(self.sources[row].get("name", ""))
+        runtime = self.runtimes.get(source_name)
+        if runtime is not None:
+            runtime.release()
+            runtime.capture = None
         self._persist_config(show_message=False)
 
     # ---------- live layout ----------
@@ -2617,9 +3434,23 @@ class InferenceWindow(QMainWindow):
             self._infer_last_submit_ts.pop(source_name, None)
 
     def _enqueue_inference_frame(self, source_name: str, frame: np.ndarray, submit_ts: float) -> None:
+        frame_to_infer = frame
+        source = self._get_source_by_name(source_name)
+        rect = None if source is None else source.get("ignore_rect")
+        polys = None if source is None else source.get("ignore_polys")
+        if not polys:
+            legacy_poly = None if source is None else source.get("ignore_poly")
+            if legacy_poly:
+                polys = [legacy_poly]
+        if polys:
+            frame_to_infer = frame.copy()
+            self._apply_ignore_polys(frame_to_infer, polys)
+        elif rect is not None:
+            frame_to_infer = frame.copy()
+            self._apply_ignore_rect(frame_to_infer, rect)
         with self._infer_lock:
             # Keep only the newest frame for each source (drop stale work).
-            self._infer_pending_frames[source_name] = frame
+            self._infer_pending_frames[source_name] = frame_to_infer
             self._infer_last_submit_ts[source_name] = float(submit_ts)
 
     def _pull_inference_batch(self) -> tuple[list[str], list[np.ndarray]]:
@@ -3269,9 +4100,14 @@ class InferenceWindow(QMainWindow):
         source_fps = runtime.smoothed_source_fps or source_fps
         view_fps = runtime.smoothed_view_fps or view_fps
         ai_fps = runtime.smoothed_infer_fps or ai_fps
+        mask_on = False
+        source = self._get_source_by_name(source_name)
+        if source is not None:
+            mask_on = bool(source.get("ignore_polys") or source.get("ignore_poly") or source.get("ignore_rect"))
+        mask_text = " | mask:on" if mask_on else ""
         meta = (
             f"{runtime.status} | mode:{runtime.mode} | person:{runtime.person_count} "
-            f"| src:{source_fps:.1f} | view:{view_fps:.1f} | ai:{ai_fps:.1f}"
+            f"| src:{source_fps:.1f} | view:{view_fps:.1f} | ai:{ai_fps:.1f}{mask_text}"
         )
 
         tile = self.tiles.get(source_name)
@@ -4247,7 +5083,8 @@ class InferenceWindow(QMainWindow):
         self.config["runtime"] = dict(self.runtime_cfg)
         self.config.pop("sources", None)
 
-        save_yaml(self.config_path, self.config)
+        self.app_settings_dir.mkdir(parents=True, exist_ok=True)
+        save_yaml(self.app_config_path, self.config)
         try:
             self._save_sources_config()
         except Exception as exc:  # noqa: BLE001
@@ -4257,7 +5094,7 @@ class InferenceWindow(QMainWindow):
             QMessageBox.information(
                 self,
                 "Config",
-                f"Settings saved:\n{self.config_path}\nSources saved:\n{self.sources_settings_path}",
+                f"Settings saved:\n{self.app_config_path}\nSources saved:\n{self.sources_settings_path}",
             )
 
     # ---------- Qt hooks ----------
