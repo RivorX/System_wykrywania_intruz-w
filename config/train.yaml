@@ -1,8 +1,13 @@
+# === PROJECT ===
+# ------------------------------------------------------------
 project:
   name: intrusion_detection
   logs_dir: logs/train
   runs_prefix: auto # auto => bierze prefix z model.name, np. yolo26n_train
 
+
+# === MODEL ===
+# ------------------------------------------------------------
 model:
   # Model guide (dla YOLO26):
   # - yolo26n.pt: najszybszy, najmniejszy, dobry na start i 1k-3k obrazow
@@ -17,11 +22,17 @@ model:
   use_fallback: false
   force_redownload: false
 
+
+# === DATA ===
+# ------------------------------------------------------------
 data:
   dataset_config_path: config/dataset.yaml
   auto_prepare: true
   dataset_yaml_path:
 
+
+# === TRAINING ===
+# ------------------------------------------------------------
 training:
   run_name:
   epochs: 100

@@ -1,5 +1,7 @@
+# === MODEL ===
+# ------------------------------------------------------------
 model:
-  name: yolo26n.pt
+  name: yolo26s.pt
   local_weights_dir: models/base
   auto_download: true
   trained_weights:
@@ -12,7 +14,10 @@ model:
   fallback_name: null
   use_fallback: false
   force_redownload: false
-  selected_model_path: models\base\yolo26n.pt
+  selected_model_path: models\base\yolo26s.pt
+
+# === INFERENCE ===
+# ------------------------------------------------------------
 inference:
   conf: 0.27
   iou: 0.42
@@ -22,9 +27,12 @@ inference:
   - 0
   device: '0'
   half: true
-  compile: false
+  compile: true
   fix_unicode_cache_paths: true
-  cache_root_dir: D:/torch_cache
+  cache_root_dir: C:/torch_cache
+
+# === TRACKER ===
+# ------------------------------------------------------------
 tracker:
   enabled: true
   frame_rate: 30
@@ -34,21 +42,31 @@ tracker:
   track_buffer: 30
   match_thresh: 0.8
   fuse_score: true
+
+# === SECURITY ===
+# ------------------------------------------------------------
 security:
   mode: auto
   night_start_hour: 22
   night_end_hour: 6
   day_person_threshold: 1
   night_person_threshold: 1
+
+# === EVENTS ===
+# ------------------------------------------------------------
 events:
   enabled: true
   min_visible_seconds: 4.0
   cooldown_seconds: 11.0
+  linger_seconds: 5.0
   min_person_count: 1
   max_saved_events: 302
   save_annotated_frame: true
   once_per_streak: true
   output_dir: logs/app/events
+
+# === RUNTIME ===
+# ------------------------------------------------------------
 runtime:
   scan_max_index: 8
   auto_start_live: true
@@ -63,9 +81,10 @@ runtime:
   last_recording_path: data\videos\demo.mp4
   frame_interval_ms: 16
   view_target_fps: 60.0
+  view_fps_smoothing: 0.2
   view_cap_to_source_fps: true
   video_fps_fallback: 25.0
-  model_target_fps: 8.0
+  model_target_fps: 30.0
   max_infer_per_tick: 2
   capture_buffer_size: 1
   camera_width: 1280

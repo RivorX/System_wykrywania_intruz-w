@@ -20,7 +20,7 @@ import cv2
 import numpy as np
 from ultralytics import YOLO
 
-from PyQt6.QtCore import QEvent, QPoint, Qt, QTimer, pyqtSignal
+from PyQt6.QtCore import QEvent, QPoint, QSize, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QImage, QPixmap
 from PyQt6.QtWidgets import (
     QApplication,
@@ -114,6 +114,12 @@ def _safe_file_part(value: str, fallback: str = "source") -> str:
 
 def _clamp(value: float, lower: float, upper: float) -> float:
     return max(lower, min(upper, value))
+
+
+def _ema(previous: float, value: float, alpha: float) -> float:
+    if previous <= 0.0:
+        return value
+    return previous + alpha * (value - previous)
 
 
 def _to_relative_or_abs(path_value: Path) -> str:
@@ -337,6 +343,9 @@ class SourceRuntime:
     playback_interval_sec: float = 0.0
     last_frame_due_ts: float = 0.0
     ui_fps: float = 0.0
+    smoothed_source_fps: float = 0.0
+    smoothed_view_fps: float = 0.0
+    smoothed_infer_fps: float = 0.0
     last_render_ts: float = 0.0
     person_count: int = 0
     alert: bool = False
@@ -357,6 +366,8 @@ class SourceRuntime:
     last_event_capture_ts: float = 0.0
     event_saved_in_streak: bool = False
     event_clip_started_wall_ts: float = 0.0
+    event_last_seen_ts: float = 0.0
+    event_max_person_count: int = 0
     event_clip_temp_path: Path | None = None
     event_clip_writer: cv2.VideoWriter | None = None
     event_clip_frame_size: tuple[int, int] | None = None
@@ -456,8 +467,7 @@ class VideoCanvas(QLabel):
             self.setText(f"{self.source_name}\\nBrak klatki")
             return
 
-        frame = _apply_zoom_pan(self._frame, self._zoom, self._pan_x, self._pan_y)
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        rgb = cv2.cvtColor(self._frame, cv2.COLOR_BGR2RGB)
         height, width = rgb.shape[:2]
         image = QImage(rgb.data, width, height, width * 3, QImage.Format.Format_RGB888)
         pixmap = QPixmap.fromImage(image)
@@ -466,17 +476,49 @@ class VideoCanvas(QLabel):
 
         self.setText("")
         if self._expand_mode:
-            self.setScaledContents(False)
-            scaled = pixmap.scaled(
-                self.size(),
-                Qt.AspectRatioMode.KeepAspectRatioByExpanding,
-                Qt.TransformationMode.SmoothTransformation,
-            )
-            self.setPixmap(scaled)
+            transform = Qt.TransformationMode.SmoothTransformation
         else:
             # In grid mode prioritize throughput over visual smoothing.
-            self.setScaledContents(True)
-            self.setPixmap(pixmap)
+            transform = Qt.TransformationMode.FastTransformation
+
+        view_w = max(1, int(self.width()))
+        view_h = max(1, int(self.height()))
+        zoom = max(1.0, float(self._zoom))
+
+        if zoom <= 1.01:
+            self.setScaledContents(False)
+            scaled = pixmap.scaled(
+                QSize(view_w, view_h),
+                Qt.AspectRatioMode.KeepAspectRatio,
+                transform,
+            )
+            self.setPixmap(scaled)
+            return
+
+        target_w = max(1, int(view_w * zoom))
+        target_h = max(1, int(view_h * zoom))
+        scaled = pixmap.scaled(
+            QSize(target_w, target_h),
+            Qt.AspectRatioMode.KeepAspectRatio,
+            transform,
+        )
+
+        if scaled.width() <= view_w and scaled.height() <= view_h:
+            self.setScaledContents(False)
+            self.setPixmap(scaled)
+            return
+
+        max_shift_x = max(0, int((scaled.width() - view_w) / 2))
+        max_shift_y = max(0, int((scaled.height() - view_h) / 2))
+        center_x = int((scaled.width() / 2) + _clamp(self._pan_x, -1.0, 1.0) * max_shift_x)
+        center_y = int((scaled.height() / 2) + _clamp(self._pan_y, -1.0, 1.0) * max_shift_y)
+
+        x0 = int(_clamp(center_x - (view_w / 2), 0, max(0, scaled.width() - view_w)))
+        y0 = int(_clamp(center_y - (view_h / 2), 0, max(0, scaled.height() - view_h)))
+
+        cropped = scaled.copy(x0, y0, view_w, view_h)
+        self.setScaledContents(False)
+        self.setPixmap(cropped)
 
     def resizeEvent(self, event: Any) -> None:  # noqa: ANN401
         super().resizeEvent(event)
@@ -774,6 +816,7 @@ class InferenceWindow(QMainWindow):
         self.events_enabled = bool(self.events_cfg.get("enabled", True))
         self.events_min_visible_seconds = max(0.1, float(self.events_cfg.get("min_visible_seconds", 3.0)))
         self.events_cooldown_seconds = max(0.0, float(self.events_cfg.get("cooldown_seconds", 10.0)))
+        self.events_linger_seconds = max(0.0, float(self.events_cfg.get("linger_seconds", 1.5)))
         self.events_min_person_count = max(1, int(self.events_cfg.get("min_person_count", 1)))
         self.events_save_annotated = bool(self.events_cfg.get("save_annotated_frame", True))
         self.events_once_per_streak = bool(self.events_cfg.get("once_per_streak", True))
@@ -1162,6 +1205,11 @@ class InferenceWindow(QMainWindow):
         self.events_cooldown_spin.setSingleStep(0.5)
         self.events_cooldown_spin.setDecimals(1)
 
+        self.events_linger_spin = QDoubleSpinBox()
+        self.events_linger_spin.setRange(0.0, 30.0)
+        self.events_linger_spin.setSingleStep(0.2)
+        self.events_linger_spin.setDecimals(1)
+
         self.events_min_person_spin = QSpinBox()
         self.events_min_person_spin.setRange(1, 20)
 
@@ -1188,14 +1236,16 @@ class InferenceWindow(QMainWindow):
         events_grid.addWidget(self.events_min_visible_spin, 1, 1)
         events_grid.addWidget(QLabel("Cooldown miedzy zapisami (s):"), 2, 0)
         events_grid.addWidget(self.events_cooldown_spin, 2, 1)
-        events_grid.addWidget(QLabel("Min. liczba osob:"), 3, 0)
-        events_grid.addWidget(self.events_min_person_spin, 3, 1)
-        events_grid.addWidget(QLabel("Maks. liczba zapisanych zdarzen:"), 4, 0)
-        events_grid.addWidget(self.events_max_saved_spin, 4, 1)
-        events_grid.addWidget(self.events_save_annotated_checkbox, 5, 0, 1, 2)
-        events_grid.addWidget(self.events_once_per_streak_checkbox, 6, 0, 1, 2)
-        events_grid.addWidget(QLabel("Folder zapisu zdarzen:"), 7, 0)
-        events_grid.addWidget(output_row_widget, 7, 1)
+        events_grid.addWidget(QLabel("Dodatkowy czas po zaniku (s):"), 3, 0)
+        events_grid.addWidget(self.events_linger_spin, 3, 1)
+        events_grid.addWidget(QLabel("Min. liczba osob:"), 4, 0)
+        events_grid.addWidget(self.events_min_person_spin, 4, 1)
+        events_grid.addWidget(QLabel("Maks. liczba zapisanych zdarzen:"), 5, 0)
+        events_grid.addWidget(self.events_max_saved_spin, 5, 1)
+        events_grid.addWidget(self.events_save_annotated_checkbox, 6, 0, 1, 2)
+        events_grid.addWidget(self.events_once_per_streak_checkbox, 7, 0, 1, 2)
+        events_grid.addWidget(QLabel("Folder zapisu zdarzen:"), 8, 0)
+        events_grid.addWidget(output_row_widget, 8, 1)
 
         layout.addWidget(events_box)
 
@@ -1650,6 +1700,7 @@ class InferenceWindow(QMainWindow):
         self.events_enabled_checkbox.setChecked(bool(self.events_cfg.get("enabled", True)))
         self.events_min_visible_spin.setValue(float(self.events_cfg.get("min_visible_seconds", 3.0)))
         self.events_cooldown_spin.setValue(float(self.events_cfg.get("cooldown_seconds", 10.0)))
+        self.events_linger_spin.setValue(float(self.events_cfg.get("linger_seconds", 1.5)))
         self.events_min_person_spin.setValue(int(self.events_cfg.get("min_person_count", 1)))
         self.events_max_saved_spin.setValue(int(self.events_cfg.get("max_saved_events", 300)))
         self.events_save_annotated_checkbox.setChecked(bool(self.events_cfg.get("save_annotated_frame", True)))
@@ -1682,6 +1733,7 @@ class InferenceWindow(QMainWindow):
         self.events_enabled_checkbox.toggled.connect(self._on_setting_changed)
         self.events_min_visible_spin.valueChanged.connect(self._on_setting_changed)
         self.events_cooldown_spin.valueChanged.connect(self._on_setting_changed)
+        self.events_linger_spin.valueChanged.connect(self._on_setting_changed)
         self.events_min_person_spin.valueChanged.connect(self._on_setting_changed)
         self.events_max_saved_spin.valueChanged.connect(self._on_setting_changed)
         self.events_save_annotated_checkbox.toggled.connect(self._on_setting_changed)
@@ -2363,7 +2415,11 @@ class InferenceWindow(QMainWindow):
             self._switch_to_grid_view()
 
     def _switch_to_grid_view(self) -> None:
+        previous_source = self.focused_source
         self._close_fullscreen_source()
+        if previous_source:
+            self.zoom_levels[previous_source] = 1.0
+            self.pan_offsets[previous_source] = (0.0, 0.0)
         self.focused_source = None
         self.zoom_label.setText("Zoom: 1.00x")
         self._rebuild_live_layout()
@@ -2904,6 +2960,9 @@ class InferenceWindow(QMainWindow):
         runtime.fps = 0.0
         runtime.infer_fps = 0.0
         runtime.ui_fps = 0.0
+        runtime.smoothed_source_fps = 0.0
+        runtime.smoothed_view_fps = 0.0
+        runtime.smoothed_infer_fps = 0.0
         runtime.last_render_ts = 0.0
         runtime.last_boxes = None
         runtime.last_decorated_capture_seq = 0
@@ -2913,6 +2972,8 @@ class InferenceWindow(QMainWindow):
         runtime.person_visible_duration_sec = 0.0
         runtime.last_event_capture_ts = 0.0
         runtime.event_saved_in_streak = False
+        runtime.event_last_seen_ts = 0.0
+        runtime.event_max_person_count = 0
         self._clear_async_state_for_source(source_name)
         with self._infer_lock:
             self.trackers.pop(source_name, None)
@@ -3195,9 +3256,22 @@ class InferenceWindow(QMainWindow):
         view_fps = runtime.ui_fps if runtime.ui_fps > 0.0 else runtime.fps
         if source_fps > 0.0:
             view_fps = min(view_fps, source_fps)
+        ai_fps = runtime.infer_fps
+
+        smooth_alpha = float(_clamp(float(self.runtime_cfg.get("view_fps_smoothing", 0.2)), 0.0, 1.0))
+        if source_fps > 0.0:
+            runtime.smoothed_source_fps = _ema(runtime.smoothed_source_fps, source_fps, smooth_alpha)
+        if view_fps > 0.0:
+            runtime.smoothed_view_fps = _ema(runtime.smoothed_view_fps, view_fps, smooth_alpha)
+        if ai_fps > 0.0:
+            runtime.smoothed_infer_fps = _ema(runtime.smoothed_infer_fps, ai_fps, smooth_alpha)
+
+        source_fps = runtime.smoothed_source_fps or source_fps
+        view_fps = runtime.smoothed_view_fps or view_fps
+        ai_fps = runtime.smoothed_infer_fps or ai_fps
         meta = (
             f"{runtime.status} | mode:{runtime.mode} | person:{runtime.person_count} "
-            f"| src:{source_fps:.1f} | view:{view_fps:.1f} | ai:{runtime.infer_fps:.1f}"
+            f"| src:{source_fps:.1f} | view:{view_fps:.1f} | ai:{ai_fps:.1f}"
         )
 
         tile = self.tiles.get(source_name)
@@ -3873,6 +3947,7 @@ class InferenceWindow(QMainWindow):
         frames_written = int(runtime.event_clip_frames_written)
         wall_ts = runtime.event_clip_started_wall_ts if runtime.event_clip_started_wall_ts > 0.0 else time.time()
         visible_sec = float(runtime.person_visible_duration_sec)
+        max_person_count = int(runtime.event_max_person_count)
         temp_path = self._clear_event_clip_state(runtime, delete_temp_file=False)
         if temp_path is None:
             return
@@ -3929,7 +4004,7 @@ class InferenceWindow(QMainWindow):
             "timestamp": float(wall_ts),
             "source": source_name,
             "mode": runtime.mode,
-            "persons": int(runtime.person_count),
+            "persons": max_person_count,
             "visible_sec": visible_sec,
             "alert": bool(runtime.alert),
             "file": _to_relative_or_abs(output_path),
@@ -3940,6 +4015,8 @@ class InferenceWindow(QMainWindow):
 
         runtime.last_event_capture_ts = now_ts
         runtime.event_saved_in_streak = True
+        runtime.event_last_seen_ts = 0.0
+        runtime.event_max_person_count = 0
 
         show_latest = bool(
             hasattr(self, "main_tabs")
@@ -3997,12 +4074,24 @@ class InferenceWindow(QMainWindow):
                 runtime.person_visible_duration_sec = 0.0
                 runtime.event_saved_in_streak = False
                 runtime.event_clip_started_wall_ts = time.time()
+                runtime.event_last_seen_ts = now_ts
+                runtime.event_max_person_count = int(runtime.person_count)
             else:
                 runtime.person_visible_duration_sec = max(0.0, now_ts - runtime.person_visible_since_ts)
+                runtime.event_last_seen_ts = now_ts
+                runtime.event_max_person_count = max(runtime.event_max_person_count, int(runtime.person_count))
             return
 
         if runtime.person_visible_since_ts > 0.0:
-            runtime.person_visible_duration_sec = max(0.0, now_ts - runtime.person_visible_since_ts)
+            runtime.person_visible_duration_sec = max(
+                0.0,
+                (runtime.event_last_seen_ts or now_ts) - runtime.person_visible_since_ts,
+            )
+            linger_ok = bool(self.events_linger_seconds > 0.0) and (
+                now_ts - (runtime.event_last_seen_ts or now_ts) <= self.events_linger_seconds
+            )
+            if linger_ok:
+                return
             self._finalize_event_clip(source_name, runtime, now_ts)
         else:
             self._clear_event_clip_state(runtime, delete_temp_file=True)
@@ -4010,6 +4099,8 @@ class InferenceWindow(QMainWindow):
         runtime.person_visible_since_ts = 0.0
         runtime.person_visible_duration_sec = 0.0
         runtime.event_saved_in_streak = False
+        runtime.event_last_seen_ts = 0.0
+        runtime.event_max_person_count = 0
 
     def _maybe_capture_event_snapshot(
         self,
@@ -4110,6 +4201,7 @@ class InferenceWindow(QMainWindow):
         self.events_cfg["enabled"] = bool(self.events_enabled_checkbox.isChecked())
         self.events_cfg["min_visible_seconds"] = float(self.events_min_visible_spin.value())
         self.events_cfg["cooldown_seconds"] = float(self.events_cooldown_spin.value())
+        self.events_cfg["linger_seconds"] = float(self.events_linger_spin.value())
         self.events_cfg["min_person_count"] = int(self.events_min_person_spin.value())
         self.events_cfg["max_saved_events"] = int(self.events_max_saved_spin.value())
         self.events_cfg["save_annotated_frame"] = bool(self.events_save_annotated_checkbox.isChecked())
@@ -4120,6 +4212,7 @@ class InferenceWindow(QMainWindow):
         self.events_enabled = bool(self.events_cfg["enabled"])
         self.events_min_visible_seconds = max(0.1, float(self.events_cfg["min_visible_seconds"]))
         self.events_cooldown_seconds = max(0.0, float(self.events_cfg["cooldown_seconds"]))
+        self.events_linger_seconds = max(0.0, float(self.events_cfg["linger_seconds"]))
         self.events_min_person_count = max(1, int(self.events_cfg["min_person_count"]))
         self.events_max_saved = max(0, int(self.events_cfg["max_saved_events"]))
         self.events_save_annotated = bool(self.events_cfg["save_annotated_frame"])

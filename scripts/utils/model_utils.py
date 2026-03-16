@@ -109,13 +109,20 @@ def _persist_model_to_local_dir(
     if target_path.exists():
         return str(target_path)
 
+    # If Ultralytics auto-downloads into the project root, move it into models/base
+    project_root = (base_dir or Path.cwd()).resolve()
+
     for source_path in _candidate_checkpoint_paths(reference, model):
         if source_path == target_path:
             return str(target_path)
         try:
             target_path.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(source_path, target_path)
-            print(f"[model] Saved base model to {target_path}")
+            if source_path.parent == project_root and source_path.name == model_name:
+                shutil.move(str(source_path), str(target_path))
+                print(f"[model] Moved base model to {target_path}")
+            else:
+                shutil.copy2(source_path, target_path)
+                print(f"[model] Saved base model to {target_path}")
             return str(target_path)
         except Exception:  # noqa: BLE001
             continue

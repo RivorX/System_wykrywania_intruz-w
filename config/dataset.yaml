@@ -1,8 +1,13 @@
+# === DATASET ===
+# ------------------------------------------------------------
 dataset:
   name: intrusion_people
   output_dir: data/processed/intrusion_people
   dataset_yaml_name: dataset.yaml
 
+
+# === DOWNLOAD ===
+# ------------------------------------------------------------
 download:
   provider: coco_person_subset
   auto_download: true
@@ -24,11 +29,17 @@ download:
   target_category_ids:
     - 1
 
+
+# === SOURCE LAYOUT ===
+# ------------------------------------------------------------
 source_layout:
   images_dir: images
   labels_dir: labels
   recurse_images: true
 
+
+# === PREPARE ===
+# ------------------------------------------------------------
 prepare:
   force_prepare: false
   keep_only_annotated: true
