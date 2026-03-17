@@ -39,9 +39,9 @@ tracker:
   track_high_thresh: 0.5
   track_low_thresh: 0.1
   new_track_thresh: 0.6
-  track_buffer: 30
+  track_buffer: 15
   match_thresh: 0.8
-  fuse_score: true
+  fuse_score: false
 
 # === SECURITY ===
 # ------------------------------------------------------------

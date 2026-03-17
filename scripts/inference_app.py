@@ -1,6 +1,7 @@
 ﻿from __future__ import annotations
 
 import argparse
+from collections import deque
 import csv
 import importlib.util
 import json
@@ -122,6 +123,13 @@ def _ema(previous: float, value: float, alpha: float) -> float:
     if previous <= 0.0:
         return value
     return previous + alpha * (value - previous)
+
+
+def _quantize_fps(value: float, step: float = 0.5) -> float:
+    if value <= 0.0:
+        return 0.0
+    safe_step = max(0.1, float(step))
+    return round(value / safe_step) * safe_step
 
 
 def _to_relative_or_abs(path_value: Path) -> str:
@@ -354,6 +362,10 @@ class SourceRuntime:
     smoothed_source_fps: float = 0.0
     smoothed_view_fps: float = 0.0
     smoothed_infer_fps: float = 0.0
+    display_source_fps: float = 0.0
+    display_view_fps: float = 0.0
+    display_infer_fps: float = 0.0
+    last_meta_fps_update_ts: float = 0.0
     last_render_ts: float = 0.0
     person_count: int = 0
     alert: bool = False
@@ -380,6 +392,8 @@ class SourceRuntime:
     event_clip_writer: cv2.VideoWriter | None = None
     event_clip_frame_size: tuple[int, int] | None = None
     event_clip_frames_written: int = 0
+    event_clip_generation: int = 0
+    event_clip_failed: bool = False
 
     def release(self) -> None:
         if self.capture_reader_stop_event is not None:
@@ -940,6 +954,8 @@ class InferenceWindow(QMainWindow):
         self._load_app_config_overlay()
         self.sources_settings_path = self.app_settings_dir / "sources.yaml"
         self.sources = self._load_sources_config()
+        self.source_by_name: dict[str, dict[str, Any]] = {}
+        self._rebuild_source_lookup()
 
         self.model_cfg = dict(self.config.get("model", {}) or {})
         self.inference_cfg = dict(self.config.get("inference", {}) or {})
@@ -989,6 +1005,7 @@ class InferenceWindow(QMainWindow):
         self._capture_lock = threading.RLock()
         self._infer_lock = threading.RLock()
         self._infer_stop_event = threading.Event()
+        self._infer_has_work_event = threading.Event()
         self._infer_thread: threading.Thread | None = None
         self._infer_pending_frames: dict[str, np.ndarray] = {}
         self._infer_results: dict[str, AsyncInferenceResult] = {}
@@ -996,6 +1013,12 @@ class InferenceWindow(QMainWindow):
         self._infer_worker_error: str | None = None
         self._infer_notices: list[str] = []
         self._infer_worker_rr_cursor = 0
+        self._ignore_mask_cache: dict[str, tuple[tuple[int, int], str, np.ndarray]] = {}
+        self._event_writer_cond = threading.Condition()
+        self._event_writer_queue: deque[tuple[str, int, np.ndarray]] = deque()
+        self._event_writer_pending: dict[tuple[str, int], int] = {}
+        self._event_writer_stop = False
+        self._event_writer_thread: threading.Thread | None = None
         self._live_timer_interval_ms = int(max(1, self.frame_interval_ms))
         self._live_timer_last_adjust_ts = 0.0
         self.events_enabled = bool(self.events_cfg.get("enabled", True))
@@ -1040,6 +1063,8 @@ class InferenceWindow(QMainWindow):
 
         self.recording_timer = QTimer(self)
         self.recording_timer.timeout.connect(self._tick_recording)
+
+        self._start_event_writer_thread()
 
         self._load_model()
         self._build_ui()
@@ -2582,6 +2607,13 @@ class InferenceWindow(QMainWindow):
         }
         save_yaml(self.sources_settings_path, payload)
 
+    def _rebuild_source_lookup(self) -> None:
+        self.source_by_name = {
+            str(source.get("name", "")): source
+            for source in self.sources
+            if str(source.get("name", ""))
+        }
+
     def _load_app_config_overlay(self) -> None:
         if not self.app_config_path.exists():
             return
@@ -2682,6 +2714,7 @@ class InferenceWindow(QMainWindow):
         if extra:
             source.update(extra)
         self.sources.append(source)
+        self._rebuild_source_lookup()
         self._sync_runtimes_with_sources()
         self._rebuild_source_table()
         self._rebuild_live_layout()
@@ -2754,10 +2787,80 @@ class InferenceWindow(QMainWindow):
         self.stream_name_edit.clear()
 
     def _get_source_by_name(self, source_name: str) -> dict[str, Any] | None:
-        for source in self.sources:
-            if str(source.get("name", "")) == source_name:
-                return source
-        return None
+        return self.source_by_name.get(source_name)
+
+    def _source_ignore_signature(self, source: dict[str, Any] | None) -> str:
+        if source is None:
+            return ""
+        payload = {
+            "ignore_rect": source.get("ignore_rect"),
+            "ignore_poly": source.get("ignore_poly"),
+            "ignore_polys": source.get("ignore_polys"),
+        }
+        return json.dumps(payload, sort_keys=True, ensure_ascii=True)
+
+    def _get_or_build_ignore_mask(
+        self,
+        source_name: str,
+        source: dict[str, Any] | None,
+        frame: np.ndarray,
+    ) -> np.ndarray | None:
+        if source is None:
+            return None
+
+        h, w = frame.shape[:2]
+        signature = self._source_ignore_signature(source)
+        cached = self._ignore_mask_cache.get(source_name)
+        if cached is not None:
+            cached_size, cached_signature, cached_mask = cached
+            if cached_size == (h, w) and cached_signature == signature:
+                return cached_mask
+
+        rect = source.get("ignore_rect")
+        polys = source.get("ignore_polys")
+        if not polys:
+            legacy_poly = source.get("ignore_poly")
+            if legacy_poly:
+                polys = [legacy_poly]
+
+        if rect is None and not polys:
+            self._ignore_mask_cache.pop(source_name, None)
+            return None
+
+        mask = np.full((h, w), 255, dtype=np.uint8)
+        if rect is not None:
+            try:
+                x0, y0, x1, y1 = rect
+                left = int(_clamp(float(x0), 0.0, 1.0) * w)
+                right = int(_clamp(float(x1), 0.0, 1.0) * w)
+                top = int(_clamp(float(y0), 0.0, 1.0) * h)
+                bottom = int(_clamp(float(y1), 0.0, 1.0) * h)
+                if right > left and bottom > top:
+                    mask[top:bottom, left:right] = 0
+            except Exception:  # noqa: BLE001
+                pass
+
+        if polys:
+            for poly in polys:
+                if not isinstance(poly, (list, tuple)) or len(poly) < 3:
+                    continue
+                pts: list[list[int]] = []
+                for point in poly:
+                    if not isinstance(point, (list, tuple)) or len(point) != 2:
+                        continue
+                    try:
+                        x = int(_clamp(float(point[0]), 0.0, 1.0) * w)
+                        y = int(_clamp(float(point[1]), 0.0, 1.0) * h)
+                    except Exception:  # noqa: BLE001
+                        continue
+                    pts.append([x, y])
+                if len(pts) < 3:
+                    continue
+                contour = np.array(pts, dtype=np.int32).reshape((-1, 1, 2))
+                cv2.fillPoly(mask, [contour], 0)
+
+        self._ignore_mask_cache[source_name] = ((h, w), signature, mask)
+        return mask
 
     def _update_video_duplicate_hint(self) -> None:
         if not hasattr(self, "video_duplicate_label"):
@@ -2840,6 +2943,8 @@ class InferenceWindow(QMainWindow):
             source["ignore_polys"] = new_poly
         source.pop("ignore_poly", None)
         source.pop("ignore_rect", None)
+        self._ignore_mask_cache.pop(source_name, None)
+        self._rebuild_source_lookup()
         self._persist_config(show_message=False)
         self._rebuild_source_table()
 
@@ -2856,6 +2961,8 @@ class InferenceWindow(QMainWindow):
             self._finalize_event_clip(source_name, runtime, time.perf_counter())
             runtime.release()
         self._clear_async_state_for_source(source_name)
+        self._ignore_mask_cache.pop(source_name, None)
+        self._rebuild_source_lookup()
         with self._infer_lock:
             self.trackers.pop(source_name, None)
 
@@ -2873,6 +2980,7 @@ class InferenceWindow(QMainWindow):
         self._log(f"Source removed: {source_name}")
 
     def _sync_runtimes_with_sources(self) -> None:
+        self._rebuild_source_lookup()
         source_names = {str(source.get("name", "")) for source in self.sources}
 
         for name in list(self.runtimes):
@@ -2882,6 +2990,7 @@ class InferenceWindow(QMainWindow):
             self.runtimes[name].release()
             del self.runtimes[name]
             self._clear_async_state_for_source(name)
+            self._ignore_mask_cache.pop(name, None)
             with self._infer_lock:
                 self.trackers.pop(name, None)
 
@@ -3025,6 +3134,7 @@ class InferenceWindow(QMainWindow):
         if row < 0 or row >= len(self.sources):
             return
         self.sources[row]["enabled"] = enabled
+        self._rebuild_source_lookup()
 
         source_name = str(self.sources[row].get("name", ""))
         if not enabled:
@@ -3050,6 +3160,7 @@ class InferenceWindow(QMainWindow):
         if str(self.sources[row].get("type", "")) != "video":
             return
         self.sources[row]["random_start"] = enabled
+        self._rebuild_source_lookup()
 
         source_name = str(self.sources[row].get("name", ""))
         runtime = self.runtimes.get(source_name)
@@ -3435,28 +3546,22 @@ class InferenceWindow(QMainWindow):
 
     def _enqueue_inference_frame(self, source_name: str, frame: np.ndarray, submit_ts: float) -> None:
         frame_to_infer = frame
-        source = self._get_source_by_name(source_name)
-        rect = None if source is None else source.get("ignore_rect")
-        polys = None if source is None else source.get("ignore_polys")
-        if not polys:
-            legacy_poly = None if source is None else source.get("ignore_poly")
-            if legacy_poly:
-                polys = [legacy_poly]
-        if polys:
-            frame_to_infer = frame.copy()
-            self._apply_ignore_polys(frame_to_infer, polys)
-        elif rect is not None:
-            frame_to_infer = frame.copy()
-            self._apply_ignore_rect(frame_to_infer, rect)
+        runtime = self.runtimes.get(source_name)
+        source = runtime.source if runtime is not None else self._get_source_by_name(source_name)
+        mask = self._get_or_build_ignore_mask(source_name, source, frame)
+        if mask is not None:
+            frame_to_infer = cv2.bitwise_and(frame, frame, mask=mask)
         with self._infer_lock:
             # Keep only the newest frame for each source (drop stale work).
             self._infer_pending_frames[source_name] = frame_to_infer
             self._infer_last_submit_ts[source_name] = float(submit_ts)
+            self._infer_has_work_event.set()
 
     def _pull_inference_batch(self) -> tuple[list[str], list[np.ndarray]]:
         with self._infer_lock:
             source_names = list(self._infer_pending_frames.keys())
             if not source_names:
+                self._infer_has_work_event.clear()
                 return [], []
 
             total = len(source_names)
@@ -3473,6 +3578,10 @@ class InferenceWindow(QMainWindow):
                     continue
                 batch_sources.append(source_name)
                 batch_frames.append(frame)
+            if self._infer_pending_frames:
+                self._infer_has_work_event.set()
+            else:
+                self._infer_has_work_event.clear()
         return batch_sources, batch_frames
 
     def _start_inference_worker(self) -> None:
@@ -3481,6 +3590,7 @@ class InferenceWindow(QMainWindow):
 
         with self._infer_lock:
             self._infer_stop_event.clear()
+            self._infer_has_work_event.clear()
             self._infer_worker_error = None
             self._infer_pending_frames.clear()
             self._infer_results.clear()
@@ -3496,6 +3606,7 @@ class InferenceWindow(QMainWindow):
 
     def _stop_inference_worker(self) -> None:
         self._infer_stop_event.set()
+        self._infer_has_work_event.set()
         worker = self._infer_thread
         self._infer_thread = None
         if worker is not None and worker.is_alive():
@@ -3507,12 +3618,14 @@ class InferenceWindow(QMainWindow):
             self._infer_notices.clear()
             self._infer_worker_error = None
             self._infer_worker_rr_cursor = 0
+            self._infer_has_work_event.clear()
 
     def _inference_worker_loop(self) -> None:
         while not self._infer_stop_event.is_set():
+            if not self._infer_has_work_event.wait(0.05):
+                continue
             source_batch, frame_batch = self._pull_inference_batch()
             if not source_batch:
-                self._infer_stop_event.wait(0.002)
                 continue
 
             try:
@@ -3794,6 +3907,10 @@ class InferenceWindow(QMainWindow):
         runtime.smoothed_source_fps = 0.0
         runtime.smoothed_view_fps = 0.0
         runtime.smoothed_infer_fps = 0.0
+        runtime.display_source_fps = 0.0
+        runtime.display_view_fps = 0.0
+        runtime.display_infer_fps = 0.0
+        runtime.last_meta_fps_update_ts = 0.0
         runtime.last_render_ts = 0.0
         runtime.last_boxes = None
         runtime.last_decorated_capture_seq = 0
@@ -3968,6 +4085,15 @@ class InferenceWindow(QMainWindow):
         raw_boxes = getattr(result, "boxes", None)
         if raw_boxes is None:
             return []
+        try:
+            if len(raw_boxes) == 0:
+                return []
+        except Exception:  # noqa: BLE001
+            try:
+                if getattr(raw_boxes, "shape", (0,))[0] == 0:
+                    return []
+            except Exception:  # noqa: BLE001
+                pass
 
         with self._infer_lock:
             tracker = self.trackers.get(source_name)
@@ -4100,18 +4226,34 @@ class InferenceWindow(QMainWindow):
         source_fps = runtime.smoothed_source_fps or source_fps
         view_fps = runtime.smoothed_view_fps or view_fps
         ai_fps = runtime.smoothed_infer_fps or ai_fps
+        display_update_sec = max(0.10, float(self.runtime_cfg.get("fps_display_update_sec", 0.35)))
+        display_alpha = float(_clamp(float(self.runtime_cfg.get("fps_display_smoothing", 0.08)), 0.01, 1.0))
+        display_quant_step = max(0.1, float(self.runtime_cfg.get("fps_display_quant_step", 0.5)))
+        view_display_bias = float(_clamp(float(self.runtime_cfg.get("view_fps_display_bias", 1.03)), 1.0, 1.25))
+        ai_display_bias = float(_clamp(float(self.runtime_cfg.get("ai_fps_display_bias", 1.08)), 1.0, 1.35))
+
+        if runtime.last_meta_fps_update_ts <= 0.0 or (now - runtime.last_meta_fps_update_ts) >= display_update_sec:
+            runtime.display_source_fps = _ema(runtime.display_source_fps, source_fps, display_alpha)
+            runtime.display_view_fps = _ema(runtime.display_view_fps, view_fps * view_display_bias, display_alpha)
+            runtime.display_infer_fps = _ema(runtime.display_infer_fps, ai_fps * ai_display_bias, display_alpha)
+            runtime.last_meta_fps_update_ts = now
+
+        shown_source_fps = _quantize_fps(runtime.display_source_fps or source_fps, display_quant_step)
+        shown_view_fps = _quantize_fps(runtime.display_view_fps or view_fps, display_quant_step)
+        shown_ai_fps = _quantize_fps(runtime.display_infer_fps or ai_fps, display_quant_step)
         mask_on = False
-        source = self._get_source_by_name(source_name)
+        source = runtime.source
         if source is not None:
             mask_on = bool(source.get("ignore_polys") or source.get("ignore_poly") or source.get("ignore_rect"))
         mask_text = " | mask:on" if mask_on else ""
         meta = (
             f"{runtime.status} | mode:{runtime.mode} | person:{runtime.person_count} "
-            f"| src:{source_fps:.1f} | view:{view_fps:.1f} | ai:{ai_fps:.1f}{mask_text}"
+            f"| src:{shown_source_fps:.1f} | view:{shown_view_fps:.1f} | ai:{shown_ai_fps:.1f}{mask_text}"
         )
 
         tile = self.tiles.get(source_name)
-        if tile is not None:
+        fullscreen_active = self.focused_source == source_name and self._is_fullscreen_visible()
+        if tile is not None and not fullscreen_active:
             tile_frame = runtime.last_output
             tile.set_alert_state(runtime.alert)
             tile.update_view(
@@ -4216,7 +4358,6 @@ class InferenceWindow(QMainWindow):
                 runtime.last_output is None
                 or frame_changed
                 or ai_changed
-                or self.focused_source == source_name
             )
             if not must_refresh:
                 continue
@@ -4749,6 +4890,81 @@ class InferenceWindow(QMainWindow):
         self._refresh_events_table()
         self._log("All saved events were removed.")
 
+    def _start_event_writer_thread(self) -> None:
+        if self._event_writer_thread is not None and self._event_writer_thread.is_alive():
+            return
+        with self._event_writer_cond:
+            self._event_writer_stop = False
+            self._event_writer_queue.clear()
+            self._event_writer_pending.clear()
+        self._event_writer_thread = threading.Thread(
+            target=self._event_writer_loop,
+            name="event-clip-writer",
+            daemon=True,
+        )
+        self._event_writer_thread.start()
+
+    def _stop_event_writer_thread(self) -> None:
+        with self._event_writer_cond:
+            self._event_writer_stop = True
+            self._event_writer_cond.notify_all()
+        worker = self._event_writer_thread
+        self._event_writer_thread = None
+        if worker is not None and worker.is_alive():
+            worker.join(timeout=1.5)
+        with self._event_writer_cond:
+            self._event_writer_queue.clear()
+            self._event_writer_pending.clear()
+
+    def _event_writer_loop(self) -> None:
+        while True:
+            with self._event_writer_cond:
+                while not self._event_writer_stop and not self._event_writer_queue:
+                    self._event_writer_cond.wait(timeout=0.2)
+                if self._event_writer_stop and not self._event_writer_queue:
+                    return
+                source_name, generation, frame = self._event_writer_queue.popleft()
+
+            key = (source_name, generation)
+            runtime = self.runtimes.get(source_name)
+            if runtime is not None and runtime.event_clip_generation == generation and runtime.event_clip_writer is not None:
+                target_size = runtime.event_clip_frame_size or (frame.shape[1], frame.shape[0])
+                frame_to_write = frame
+                if frame_to_write.shape[1] != target_size[0] or frame_to_write.shape[0] != target_size[1]:
+                    frame_to_write = cv2.resize(frame_to_write, target_size, interpolation=cv2.INTER_LINEAR)
+                try:
+                    runtime.event_clip_writer.write(frame_to_write)
+                    runtime.event_clip_frames_written += 1
+                except Exception:  # noqa: BLE001
+                    runtime.event_clip_failed = True
+                    self._queue_async_notice(f"[warn] failed to write event clip frame for '{source_name}'")
+
+            with self._event_writer_cond:
+                pending = int(self._event_writer_pending.get(key, 0))
+                if pending <= 1:
+                    self._event_writer_pending.pop(key, None)
+                else:
+                    self._event_writer_pending[key] = pending - 1
+                self._event_writer_cond.notify_all()
+
+    def _enqueue_event_clip_frame(self, source_name: str, runtime: SourceRuntime, frame: np.ndarray) -> None:
+        generation = int(runtime.event_clip_generation)
+        key = (source_name, generation)
+        with self._event_writer_cond:
+            self._event_writer_queue.append((source_name, generation, frame.copy()))
+            self._event_writer_pending[key] = int(self._event_writer_pending.get(key, 0)) + 1
+            self._event_writer_cond.notify()
+
+    def _wait_for_event_clip_flush(self, source_name: str, generation: int, timeout_sec: float = 0.35) -> None:
+        key = (source_name, int(generation))
+        deadline = time.perf_counter() + max(0.01, timeout_sec)
+        with self._event_writer_cond:
+            while int(self._event_writer_pending.get(key, 0)) > 0:
+                remaining = deadline - time.perf_counter()
+                if remaining <= 0.0:
+                    break
+                self._event_writer_cond.wait(timeout=min(0.05, remaining))
+
     def _clear_event_clip_state(self, runtime: SourceRuntime, *, delete_temp_file: bool) -> Path | None:
         if runtime.event_clip_writer is not None:
             try:
@@ -4769,6 +4985,8 @@ class InferenceWindow(QMainWindow):
         runtime.event_clip_frame_size = None
         runtime.event_clip_frames_written = 0
         runtime.event_clip_started_wall_ts = 0.0
+        runtime.event_clip_generation += 1
+        runtime.event_clip_failed = False
         return temp_path
 
     def _finalize_event_clip(self, source_name: str, runtime: SourceRuntime, now_ts: float) -> None:
@@ -4780,10 +4998,14 @@ class InferenceWindow(QMainWindow):
         if not has_pending_clip:
             return
 
+        current_generation = int(runtime.event_clip_generation)
+        self._wait_for_event_clip_flush(source_name, current_generation)
+
         frames_written = int(runtime.event_clip_frames_written)
         wall_ts = runtime.event_clip_started_wall_ts if runtime.event_clip_started_wall_ts > 0.0 else time.time()
         visible_sec = float(runtime.person_visible_duration_sec)
         max_person_count = int(runtime.event_max_person_count)
+        failed = bool(runtime.event_clip_failed)
         temp_path = self._clear_event_clip_state(runtime, delete_temp_file=False)
         if temp_path is None:
             return
@@ -4795,6 +5017,7 @@ class InferenceWindow(QMainWindow):
         )
         should_save = (
             self.events_enabled
+            and not failed
             and frames_written > 0
             and temp_path.exists()
             and visible_sec >= self.events_min_visible_seconds
@@ -4900,6 +5123,8 @@ class InferenceWindow(QMainWindow):
         runtime.event_clip_temp_path = temp_path
         runtime.event_clip_frame_size = frame_size
         runtime.event_clip_frames_written = 0
+        runtime.event_clip_generation += 1
+        runtime.event_clip_failed = False
         return True
 
     def _update_event_visibility_state(self, source_name: str, runtime: SourceRuntime, now_ts: float) -> None:
@@ -4958,20 +5183,9 @@ class InferenceWindow(QMainWindow):
         if not self._ensure_event_clip_writer(source_name, runtime, clip_frame):
             return
 
-        target_size = runtime.event_clip_frame_size or (clip_frame.shape[1], clip_frame.shape[0])
-        frame_to_write = clip_frame
-        if frame_to_write.shape[1] != target_size[0] or frame_to_write.shape[0] != target_size[1]:
-            frame_to_write = cv2.resize(frame_to_write, target_size, interpolation=cv2.INTER_LINEAR)
-
         if runtime.event_clip_writer is None:
             return
-
-        try:
-            runtime.event_clip_writer.write(frame_to_write)
-            runtime.event_clip_frames_written += 1
-        except Exception:  # noqa: BLE001
-            self._queue_async_notice(f"[warn] failed to write event clip frame for '{source_name}'")
-            self._clear_event_clip_state(runtime, delete_temp_file=True)
+        self._enqueue_event_clip_frame(source_name, runtime, clip_frame)
 
     # ---------- logs ----------
     def _clear_logs(self) -> None:
@@ -5125,6 +5339,7 @@ class InferenceWindow(QMainWindow):
         self._close_fullscreen_source()
         self.stop_live()
         self._stop_inference_worker()
+        self._stop_event_writer_thread()
         self._recording_pause()
         self._release_recording_capture()
 
