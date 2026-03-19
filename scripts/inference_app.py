@@ -22,7 +22,7 @@ import numpy as np
 from ultralytics import YOLO
 
 from PyQt6.QtCore import QEvent, QPoint, QPointF, QRectF, QSize, Qt, QTimer, pyqtSignal
-from PyQt6.QtGui import QColor, QImage, QPainter, QPen, QPixmap, QPolygonF
+from PyQt6.QtGui import QColor, QImage, QPainter, QPalette, QPen, QPixmap, QPolygonF, QTextCursor
 from PyQt6.QtWidgets import (
     QApplication,
     QAbstractItemView,
@@ -72,6 +72,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 TrackedBox = tuple[int, int, int, int, float, int | None]
 EVENT_IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".bmp"}
 EVENT_VIDEO_SUFFIXES = {".mp4", ".avi", ".mkv", ".mov", ".wmv", ".m4v"}
+QIMAGE_BGR888 = getattr(QImage.Format, "Format_BGR888", None)
 
 
 def _is_compile_enabled(value: Any) -> bool:
@@ -270,45 +271,39 @@ def _read_last_run_metrics(results_csv: Path) -> dict[str, Any] | None:
     }
 
 
-def _apply_zoom_pan(frame: np.ndarray, zoom: float, pan_x: float, pan_y: float) -> np.ndarray:
-    factor = max(1.0, float(zoom))
-    if factor <= 1.01:
-        return frame
-
-    height, width = frame.shape[:2]
-    crop_w = max(2, int(width / factor))
-    crop_h = max(2, int(height / factor))
-
-    max_shift_x = max(0, (width - crop_w) // 2)
-    max_shift_y = max(0, (height - crop_h) // 2)
-
-    center_x = (width // 2) + int(_clamp(pan_x, -1.0, 1.0) * max_shift_x)
-    center_y = (height // 2) + int(_clamp(pan_y, -1.0, 1.0) * max_shift_y)
-
-    x0 = int(_clamp(center_x - (crop_w // 2), 0, max(0, width - crop_w)))
-    y0 = int(_clamp(center_y - (crop_h // 2), 0, max(0, height - crop_h)))
-
-    cropped = frame[y0 : y0 + crop_h, x0 : x0 + crop_w]
-    return cv2.resize(cropped, (width, height), interpolation=cv2.INTER_LINEAR)
-
-
-def _write_image(path: Path, frame: np.ndarray) -> bool:
-    suffix = path.suffix.lower()
-    if suffix not in {".jpg", ".jpeg", ".png", ".bmp"}:
-        suffix = ".jpg"
-        path = path.with_suffix(".jpg")
+def _frame_cache_key(frame: np.ndarray | None) -> tuple[int, tuple[int, ...], tuple[int, ...]] | None:
+    if frame is None:
+        return None
     try:
-        ok, encoded = cv2.imencode(suffix, frame)
+        data_ptr = int(frame.__array_interface__["data"][0])
     except Exception:  # noqa: BLE001
-        return False
-    if not ok:
-        return False
+        return None
+    return data_ptr, tuple(int(dim) for dim in frame.shape), tuple(int(step) for step in frame.strides)
+
+
+def _frame_to_pixmap(frame: np.ndarray | None) -> QPixmap:
+    if frame is None or frame.size == 0:
+        return QPixmap()
+
+    source = frame if frame.flags.c_contiguous else np.ascontiguousarray(frame)
+    height, width = source.shape[:2]
+    bytes_per_line = int(source.strides[0])
+
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        encoded.tofile(str(path))
-        return True
+        if QIMAGE_BGR888 is not None:
+            image = QImage(source.data, width, height, bytes_per_line, QIMAGE_BGR888)
+        else:
+            rgb = cv2.cvtColor(source, cv2.COLOR_BGR2RGB)
+            image = QImage(
+                rgb.data,
+                width,
+                height,
+                int(rgb.strides[0]),
+                QImage.Format.Format_RGB888,
+            )
+        return QPixmap.fromImage(image)
     except Exception:  # noqa: BLE001
-        return False
+        return QPixmap()
 
 
 def _open_event_video_writer(
@@ -458,6 +453,9 @@ class VideoCanvas(QLabel):
         self._expand_mode = False
         self._drag_active = False
         self._drag_last_pos: QPoint | None = None
+        self._base_pixmap = QPixmap()
+        self._frame_cache_key: tuple[int, tuple[int, ...], tuple[int, ...]] | None = None
+        self._last_render_signature: tuple[Any, ...] | None = None
 
         self.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.setMinimumSize(64, 36)
@@ -466,7 +464,10 @@ class VideoCanvas(QLabel):
         self.setText(f"{source_name}\\nBrak klatki")
 
     def set_expand_mode(self, enabled: bool) -> None:
-        self._expand_mode = bool(enabled)
+        enabled = bool(enabled)
+        if self._expand_mode == enabled:
+            return
+        self._expand_mode = enabled
         self._refresh_pixmap()
 
     def set_frame(
@@ -477,6 +478,11 @@ class VideoCanvas(QLabel):
         pan_x: float = 0.0,
         pan_y: float = 0.0,
     ) -> None:
+        frame_key = _frame_cache_key(frame)
+        if frame_key != self._frame_cache_key:
+            self._frame_cache_key = frame_key
+            self._base_pixmap = _frame_to_pixmap(frame)
+            self._last_render_signature = None
         self._frame = frame
         self._zoom = _clamp(float(zoom), 1.0, 8.0)
         self._pan_x = _clamp(float(pan_x), -1.0, 1.0)
@@ -485,15 +491,14 @@ class VideoCanvas(QLabel):
 
     def _refresh_pixmap(self) -> None:
         if self._frame is None:
+            self._last_render_signature = None
             self.setPixmap(QPixmap())
             self.setText(f"{self.source_name}\\nBrak klatki")
             return
 
-        rgb = cv2.cvtColor(self._frame, cv2.COLOR_BGR2RGB)
-        height, width = rgb.shape[:2]
-        image = QImage(rgb.data, width, height, width * 3, QImage.Format.Format_RGB888)
-        pixmap = QPixmap.fromImage(image)
+        pixmap = self._base_pixmap
         if pixmap.isNull():
+            self._last_render_signature = None
             return
 
         self.setText("")
@@ -506,6 +511,17 @@ class VideoCanvas(QLabel):
         view_w = max(1, int(self.width()))
         view_h = max(1, int(self.height()))
         zoom = max(1.0, float(self._zoom))
+        render_signature = (
+            self._frame_cache_key,
+            view_w,
+            view_h,
+            round(zoom, 3),
+            round(float(self._pan_x), 4),
+            round(float(self._pan_y), 4),
+            self._expand_mode,
+        )
+        if render_signature == self._last_render_signature:
+            return
 
         if zoom <= 1.01:
             self.setScaledContents(False)
@@ -515,6 +531,7 @@ class VideoCanvas(QLabel):
                 transform,
             )
             self.setPixmap(scaled)
+            self._last_render_signature = render_signature
             return
 
         target_w = max(1, int(view_w * zoom))
@@ -528,6 +545,7 @@ class VideoCanvas(QLabel):
         if scaled.width() <= view_w and scaled.height() <= view_h:
             self.setScaledContents(False)
             self.setPixmap(scaled)
+            self._last_render_signature = render_signature
             return
 
         max_shift_x = max(0, int((scaled.width() - view_w) / 2))
@@ -541,6 +559,7 @@ class VideoCanvas(QLabel):
         cropped = scaled.copy(x0, y0, view_w, view_h)
         self.setScaledContents(False)
         self.setPixmap(cropped)
+        self._last_render_signature = render_signature
 
     def resizeEvent(self, event: Any) -> None:  # noqa: ANN401
         super().resizeEvent(event)
@@ -600,7 +619,9 @@ class VideoTile(QWidget):
         self.source_name = source_name
         self._is_focused = False
         self._is_alert = False
+        self._header_visible = True
         self._border_width = 5
+        self._last_meta_text = "idle"
         self.setObjectName("videoTile")
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
@@ -642,17 +663,33 @@ class VideoTile(QWidget):
 
         self._refresh_style()
 
+    def _sync_header_visibility(self) -> None:
+        self.header_widget.setVisible(self._header_visible and not self._is_focused)
+
     def set_focus_state(self, focused: bool) -> None:
-        self._is_focused = bool(focused)
+        focused = bool(focused)
+        if self._is_focused == focused:
+            return
+        self._is_focused = focused
         self.canvas.set_expand_mode(self._is_focused)
-        self.header_widget.setVisible(not self._is_focused)
+        self._sync_header_visibility()
         self.root_layout.setContentsMargins(0, 0, 0, 0)
         self.root_layout.setSpacing(0)
         self._refresh_style()
 
     def set_alert_state(self, alert: bool) -> None:
-        self._is_alert = bool(alert)
+        alert = bool(alert)
+        if self._is_alert == alert:
+            return
+        self._is_alert = alert
         self._refresh_style()
+
+    def set_header_visibility(self, visible: bool) -> None:
+        visible = bool(visible)
+        if self._header_visible == visible:
+            return
+        self._header_visible = visible
+        self._sync_header_visibility()
 
     def _refresh_style(self) -> None:
         border_width = self._border_width
@@ -679,7 +716,9 @@ class VideoTile(QWidget):
         pan_x: float,
         pan_y: float,
     ) -> None:
-        self.meta_label.setText(meta_text)
+        if meta_text != self._last_meta_text:
+            self._last_meta_text = meta_text
+            self.meta_label.setText(meta_text)
         self.canvas.set_frame(frame, zoom=zoom, pan_x=pan_x, pan_y=pan_y)
 
 
@@ -997,9 +1036,11 @@ class InferenceWindow(QMainWindow):
         self.view_target_fps = float(_clamp(float(self.runtime_cfg.get("view_target_fps", 60.0)), 1.0, 60.0))
         self.model_target_fps = max(0.1, float(self.runtime_cfg.get("model_target_fps", 6.0)))
         self.max_infer_per_tick = max(1, int(self.runtime_cfg.get("max_infer_per_tick", 2)))
-        self._infer_rr_cursor = 0
         self.loop_videos = bool(self.runtime_cfg.get("loop_videos", True))
         self.live_tile_spacing = max(0, int(self.runtime_cfg.get("live_tile_spacing", 4)))
+        self.live_tile_header_visible = bool(self.runtime_cfg.get("show_live_tile_headers", True))
+        # Always start with the navigation tabs visible, even if the previous session hid them.
+        self.navigation_tabs_visible = True
 
         self._model_lock = threading.Lock()
         self._capture_lock = threading.RLock()
@@ -1017,8 +1058,13 @@ class InferenceWindow(QMainWindow):
         self._event_writer_cond = threading.Condition()
         self._event_writer_queue: deque[tuple[str, int, np.ndarray]] = deque()
         self._event_writer_pending: dict[tuple[str, int], int] = {}
+        self._event_writer_drop_notice_ts: dict[str, float] = {}
         self._event_writer_stop = False
         self._event_writer_thread: threading.Thread | None = None
+        self._event_writer_max_pending_frames = max(
+            1,
+            int(self.runtime_cfg.get("event_writer_max_pending_frames", 8)),
+        )
         self._live_timer_interval_ms = int(max(1, self.frame_interval_ms))
         self._live_timer_last_adjust_ts = 0.0
         self.events_enabled = bool(self.events_cfg.get("enabled", True))
@@ -1037,6 +1083,10 @@ class InferenceWindow(QMainWindow):
 
         self._table_updating = False
         self._log_entries: list[str] = []
+        self._pending_log_lines: list[str] = []
+        self._log_flush_interval_ms = max(20, int(self.runtime_cfg.get("log_flush_interval_ms", 120)))
+        self._log_flush_batch_size = max(1, int(self.runtime_cfg.get("log_flush_batch_size", 200)))
+        self._settings_autosave_delay_ms = max(100, int(self.runtime_cfg.get("settings_autosave_delay_ms", 400)))
         if self._tracker_disabled_reason:
             self._log(self._tracker_disabled_reason)
         elif self.tracker_enabled:
@@ -1064,6 +1114,14 @@ class InferenceWindow(QMainWindow):
         self.recording_timer = QTimer(self)
         self.recording_timer.timeout.connect(self._tick_recording)
 
+        self._log_flush_timer = QTimer(self)
+        self._log_flush_timer.setSingleShot(True)
+        self._log_flush_timer.timeout.connect(self._flush_logs_widget)
+
+        self._settings_save_timer = QTimer(self)
+        self._settings_save_timer.setSingleShot(True)
+        self._settings_save_timer.timeout.connect(self._commit_pending_settings)
+
         self._start_event_writer_thread()
 
         self._load_model()
@@ -1085,7 +1143,26 @@ class InferenceWindow(QMainWindow):
         if self.console_logs_enabled:
             print(line)
         if hasattr(self, "logs_text") and self.logs_text is not None:
-            self.logs_text.append(line)
+            self._pending_log_lines.append(line)
+            if not self._log_flush_timer.isActive():
+                self._log_flush_timer.start(self._log_flush_interval_ms)
+
+    def _flush_logs_widget(self) -> None:
+        if not hasattr(self, "logs_text") or self.logs_text is None:
+            return
+        if not self._pending_log_lines:
+            return
+
+        chunk = self._pending_log_lines[: self._log_flush_batch_size]
+        del self._pending_log_lines[: len(chunk)]
+        cursor = self.logs_text.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+        cursor.insertText("".join(f"{line}\n" for line in chunk))
+        self.logs_text.setTextCursor(cursor)
+        self.logs_text.ensureCursorVisible()
+
+        if self._pending_log_lines:
+            self._log_flush_timer.start(self._log_flush_interval_ms)
 
     def _auto_start_live_if_possible(self) -> None:
         if self.live_running:
@@ -1202,6 +1279,8 @@ class InferenceWindow(QMainWindow):
         layout.setSpacing(0)
 
         self.main_tabs = QTabWidget()
+        self.main_tabs.installEventFilter(self)
+        self.main_tabs.tabBar().installEventFilter(self)
         self.main_tabs.setTabPosition(QTabWidget.TabPosition.North)
         self.main_tabs.addTab(self._build_preview_tab(), "Podglad kamer")
         self.main_tabs.addTab(self._build_camera_config_tab(), "Konfiguracja kamer")
@@ -1209,6 +1288,46 @@ class InferenceWindow(QMainWindow):
         self.main_tabs.addTab(self._build_settings_tab(), "Ustawienia")
         self.main_tabs.addTab(self._build_logs_tab(), "Logi")
         layout.addWidget(self.main_tabs)
+
+        self.navigation_corner_widget = QWidget(self.main_tabs)
+        navigation_corner_layout = QHBoxLayout(self.navigation_corner_widget)
+        navigation_corner_layout.setContentsMargins(0, 0, 0, 0)
+        navigation_corner_layout.setSpacing(0)
+
+        self.navigation_toggle_btn = QPushButton(self.navigation_corner_widget)
+        self.navigation_toggle_btn.setFixedSize(34, 30)
+        self.navigation_toggle_btn.clicked.connect(self._toggle_navigation_tabs_visibility)
+        self.navigation_toggle_btn.setStyleSheet(
+            "QPushButton {"
+            "background-color: rgba(20, 24, 31, 225);"
+            "color: #e7edf8;"
+            "border: 1px solid #4a5568;"
+            "border-radius: 6px;"
+            "font-size: 16px;"
+            "font-weight: 700;"
+            "}"
+            "QPushButton:hover { background-color: rgba(32, 38, 48, 235); }"
+        )
+        navigation_corner_layout.addWidget(self.navigation_toggle_btn)
+        self.main_tabs.setCornerWidget(self.navigation_corner_widget, Qt.Corner.TopLeftCorner)
+
+        self.navigation_overlay_btn = QPushButton(root)
+        self.navigation_overlay_btn.setFixedSize(34, 30)
+        self.navigation_overlay_btn.clicked.connect(self._toggle_navigation_tabs_visibility)
+        self.navigation_overlay_btn.setStyleSheet(
+            "QPushButton {"
+            "background-color: rgba(20, 24, 31, 225);"
+            "color: #e7edf8;"
+            "border: 1px solid #4a5568;"
+            "border-radius: 6px;"
+            "font-size: 16px;"
+            "font-weight: 700;"
+            "}"
+            "QPushButton:hover { background-color: rgba(32, 38, 48, 235); }"
+        )
+        self.navigation_overlay_btn.hide()
+
+        self._update_navigation_toggle_button()
 
         self.exit_app_btn = QPushButton("Exit", root)
         self.exit_app_btn.setFixedSize(86, 34)
@@ -1231,9 +1350,34 @@ class InferenceWindow(QMainWindow):
         self.main_tabs.setCurrentIndex(0)
         self.preview_tabs.setCurrentIndex(0)
         self._apply_theme()
+        self._set_navigation_tabs_visibility(self.navigation_tabs_visible, persist=False)
         self._position_overlay_controls()
 
     def _apply_theme(self) -> None:
+        app = QApplication.instance()
+        if app is not None:
+            app.setStyle("Fusion")
+            palette = QPalette()
+            palette.setColor(QPalette.ColorRole.Window, QColor("#111417"))
+            palette.setColor(QPalette.ColorRole.WindowText, QColor("#d9dee7"))
+            palette.setColor(QPalette.ColorRole.Base, QColor("#10151d"))
+            palette.setColor(QPalette.ColorRole.AlternateBase, QColor("#171c26"))
+            palette.setColor(QPalette.ColorRole.ToolTipBase, QColor("#171c26"))
+            palette.setColor(QPalette.ColorRole.ToolTipText, QColor("#d9dee7"))
+            palette.setColor(QPalette.ColorRole.Text, QColor("#d9dee7"))
+            palette.setColor(QPalette.ColorRole.Button, QColor("#1d2430"))
+            palette.setColor(QPalette.ColorRole.ButtonText, QColor("#d9dee7"))
+            palette.setColor(QPalette.ColorRole.BrightText, QColor("#ffffff"))
+            palette.setColor(QPalette.ColorRole.Highlight, QColor("#2f81f7"))
+            palette.setColor(QPalette.ColorRole.HighlightedText, QColor("#ffffff"))
+            palette.setColor(QPalette.ColorRole.Light, QColor("#2b3342"))
+            palette.setColor(QPalette.ColorRole.Midlight, QColor("#222835"))
+            palette.setColor(QPalette.ColorRole.Dark, QColor("#0d1117"))
+            palette.setColor(QPalette.ColorRole.Mid, QColor("#303743"))
+            palette.setColor(QPalette.ColorRole.Shadow, QColor("#000000"))
+            palette.setColor(QPalette.ColorRole.PlaceholderText, QColor("#94a2b8"))
+            app.setPalette(palette)
+
         self.setStyleSheet(
             "QMainWindow { background: #111417; }"
             "QWidget { color: #d9dee7; font-size: 13px; }"
@@ -1813,18 +1957,9 @@ class InferenceWindow(QMainWindow):
 
         self.start_live_btn = QPushButton("Start")
         self.stop_live_btn = QPushButton("Stop")
-        self.grid_view_btn = QPushButton("Grid view")
-        self.zoom_out_btn = QPushButton("-")
-        self.zoom_in_btn = QPushButton("+")
-        self.zoom_reset_btn = QPushButton("Reset zoom")
-        self.zoom_label = QLabel("Zoom: 1.00x")
 
         self.start_live_btn.clicked.connect(self.start_live)
         self.stop_live_btn.clicked.connect(self.stop_live)
-        self.grid_view_btn.clicked.connect(self._switch_to_grid_view)
-        self.zoom_out_btn.clicked.connect(lambda: self._change_focus_zoom(-1))
-        self.zoom_in_btn.clicked.connect(lambda: self._change_focus_zoom(1))
-        self.zoom_reset_btn.clicked.connect(self._reset_focus_zoom)
 
         self.live_placeholder = QLabel("No enabled sources. Add or enable sources in Kamera config.")
         self.live_placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -1865,6 +2000,22 @@ class InferenceWindow(QMainWindow):
             "QPushButton:hover { background-color: rgba(32, 38, 48, 235); }"
         )
 
+        self.live_header_toggle_btn = QPushButton(self.preview_tabs)
+        self.live_header_toggle_btn.setFixedSize(34, 30)
+        self.live_header_toggle_btn.clicked.connect(self._toggle_live_tile_header_visibility)
+        self.live_header_toggle_btn.setStyleSheet(
+            "QPushButton {"
+            "background-color: rgba(20, 24, 31, 225);"
+            "color: #e7edf8;"
+            "border: 1px solid #4a5568;"
+            "border-radius: 6px;"
+            "font-size: 16px;"
+            "font-weight: 700;"
+            "}"
+            "QPushButton:hover { background-color: rgba(32, 38, 48, 235); }"
+        )
+        self._update_live_header_toggle_button()
+
         self.live_controls_panel = QFrame(self.preview_tabs)
         self.live_controls_panel.setFrameShape(QFrame.Shape.NoFrame)
         panel_layout = QGridLayout(self.live_controls_panel)
@@ -1873,20 +2024,9 @@ class InferenceWindow(QMainWindow):
         panel_layout.setVerticalSpacing(6)
         panel_layout.addWidget(self.start_live_btn, 0, 0)
         panel_layout.addWidget(self.stop_live_btn, 0, 1)
-        panel_layout.addWidget(self.grid_view_btn, 0, 2)
-        panel_layout.addWidget(self.zoom_out_btn, 1, 0)
-        panel_layout.addWidget(self.zoom_in_btn, 1, 1)
-        panel_layout.addWidget(self.zoom_reset_btn, 1, 2)
-        panel_layout.addWidget(self.zoom_label, 2, 0, 1, 3)
 
         self.start_live_btn.setMinimumWidth(86)
         self.stop_live_btn.setMinimumWidth(86)
-        self.grid_view_btn.setMinimumWidth(110)
-        self.zoom_out_btn.setMinimumWidth(52)
-        self.zoom_in_btn.setMinimumWidth(52)
-        self.zoom_reset_btn.setMinimumWidth(110)
-        self.zoom_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.zoom_label.setStyleSheet("color: #e6edf8; font-weight: 600;")
 
         self.live_controls_panel.setStyleSheet(
             "QFrame {"
@@ -2041,8 +2181,11 @@ class InferenceWindow(QMainWindow):
         button_row.addStretch(1)
         layout.addLayout(button_row)
 
-        for line in self._log_entries:
-            self.logs_text.append(line)
+        if self._log_entries:
+            self.logs_text.setPlainText("\n".join(self._log_entries))
+            cursor = self.logs_text.textCursor()
+            cursor.movePosition(QTextCursor.MoveOperation.End)
+            self.logs_text.setTextCursor(cursor)
 
         return page
 
@@ -2108,10 +2251,18 @@ class InferenceWindow(QMainWindow):
         if self._suppress_setting_autosave:
             return
 
+        self._settings_save_timer.start(self._settings_autosave_delay_ms)
+
+    def _commit_pending_settings(self) -> None:
         self._apply_controls_to_runtime_state()
         ensure_windows_compile_env(self.inference_cfg, compile_value=self.inference_cfg.get("compile", False))
         self._rebuild_predict_kwargs()
         self._persist_config(show_message=False)
+
+    def _flush_pending_settings(self) -> None:
+        if self._settings_save_timer.isActive():
+            self._settings_save_timer.stop()
+            self._commit_pending_settings()
 
     # ---------- model list ----------
     def _collect_run_metrics(self) -> tuple[dict[str, dict[str, Any]], str | None]:
@@ -2862,6 +3013,31 @@ class InferenceWindow(QMainWindow):
         self._ignore_mask_cache[source_name] = ((h, w), signature, mask)
         return mask
 
+    def _build_fullscreen_display_frame(self, source_name: str, frame: np.ndarray | None) -> np.ndarray | None:
+        if frame is None:
+            return None
+
+        runtime = self.runtimes.get(source_name)
+        source = runtime.source if runtime is not None else self._get_source_by_name(source_name)
+        if source is None:
+            return frame
+        if not bool(source.get("ignore_polys") or source.get("ignore_poly") or source.get("ignore_rect")):
+            return frame
+
+        mask = self._get_or_build_ignore_mask(source_name, source, frame)
+        if mask is None:
+            return frame
+
+        ignored = mask == 0
+        if not np.any(ignored):
+            return frame
+
+        output = frame.copy()
+        overlay = output.copy()
+        overlay[ignored] = (70, 95, 220)
+        cv2.addWeighted(overlay, 0.30, output, 0.70, 0.0, dst=output)
+        return output
+
     def _update_video_duplicate_hint(self) -> None:
         if not hasattr(self, "video_duplicate_label"):
             return
@@ -2878,37 +3054,6 @@ class InferenceWindow(QMainWindow):
         else:
             self.video_duplicate_label.setVisible(False)
             self.video_duplicate_label.setText("")
-
-    def _apply_ignore_rect(self, frame: np.ndarray, rect: tuple[float, float, float, float]) -> None:
-        if frame is None:
-            return
-        h, w = frame.shape[:2]
-        x0, y0, x1, y1 = rect
-        left = int(_clamp(x0, 0.0, 1.0) * w)
-        right = int(_clamp(x1, 0.0, 1.0) * w)
-        top = int(_clamp(y0, 0.0, 1.0) * h)
-        bottom = int(_clamp(y1, 0.0, 1.0) * h)
-        if right <= left or bottom <= top:
-            return
-        frame[top:bottom, left:right] = 0
-
-    def _apply_ignore_poly(self, frame: np.ndarray, poly: list[tuple[float, float]]) -> None:
-        if frame is None or not poly:
-            return
-        h, w = frame.shape[:2]
-        pts = []
-        for x, y in poly:
-            pts.append([int(_clamp(x, 0.0, 1.0) * w), int(_clamp(y, 0.0, 1.0) * h)])
-        if len(pts) < 3:
-            return
-        contour = np.array(pts, dtype=np.int32).reshape((-1, 1, 2))
-        cv2.fillPoly(frame, [contour], (0, 0, 0))
-
-    def _apply_ignore_polys(self, frame: np.ndarray, polys: list[list[tuple[float, float]]]) -> None:
-        if frame is None or not polys:
-            return
-        for poly in polys:
-            self._apply_ignore_poly(frame, poly)
 
     def _open_source_mask_editor(self) -> None:
         row = self.source_table.currentRow()
@@ -3176,6 +3321,7 @@ class InferenceWindow(QMainWindow):
     def _ensure_tile(self, source_name: str) -> VideoTile:
         tile = self.tiles.get(source_name)
         if tile is not None:
+            tile.set_header_visibility(self.live_tile_header_visible)
             return tile
 
         tile = VideoTile(source_name)
@@ -3183,6 +3329,7 @@ class InferenceWindow(QMainWindow):
         tile.right_clicked.connect(self._on_tile_right_clicked)
         tile.zoom_delta.connect(self._on_tile_zoom_delta)
         tile.pan_delta.connect(self._on_tile_pan_delta)
+        tile.set_header_visibility(self.live_tile_header_visible)
         self.tiles[source_name] = tile
         return tile
 
@@ -3192,10 +3339,6 @@ class InferenceWindow(QMainWindow):
             widget = item.widget()
             if widget is not None:
                 widget.setParent(None)
-
-    def _auto_grid_columns(self, count: int) -> int:
-        columns, _rows = self._auto_grid_dimensions(count)
-        return columns
 
     def _auto_grid_dimensions(self, count: int) -> tuple[int, int]:
         if count <= 1:
@@ -3284,7 +3427,6 @@ class InferenceWindow(QMainWindow):
         if not enabled_names:
             self.live_scroll.hide()
             self.live_placeholder.show()
-            self.zoom_label.setText("Zoom: 1.00x")
             self._position_overlay_controls()
             return
 
@@ -3323,12 +3465,6 @@ class InferenceWindow(QMainWindow):
             self.live_grid_layout.setRowStretch(row, 1)
         self._apply_grid_tile_sizes(names_to_show, columns, rows)
 
-        if self.focused_source:
-            zoom = self.zoom_levels.get(self.focused_source, 1.0)
-            self.zoom_label.setText(f"Zoom: {zoom:.2f}x")
-        else:
-            self.zoom_label.setText("Zoom: 1.00x")
-
         self._position_overlay_controls()
 
     def _on_tile_clicked(self, source_name: str) -> None:
@@ -3349,7 +3485,6 @@ class InferenceWindow(QMainWindow):
             self.zoom_levels[previous_source] = 1.0
             self.pan_offsets[previous_source] = (0.0, 0.0)
         self.focused_source = None
-        self.zoom_label.setText("Zoom: 1.00x")
         self._rebuild_live_layout()
 
     def _ensure_fullscreen_window(self) -> FullscreenVideoWindow:
@@ -3372,8 +3507,8 @@ class InferenceWindow(QMainWindow):
         if runtime is not None:
             zoom = self.zoom_levels.get(source_name, 1.0)
             pan_x, pan_y = self.pan_offsets.get(source_name, (0.0, 0.0))
-            window.set_frame(runtime.last_output, zoom=zoom, pan_x=pan_x, pan_y=pan_y)
-            self.zoom_label.setText(f"Zoom: {zoom:.2f}x")
+            fullscreen_frame = self._build_fullscreen_display_frame(source_name, runtime.last_output)
+            window.set_frame(fullscreen_frame, zoom=zoom, pan_x=pan_x, pan_y=pan_y)
         window.showFullScreen()
         window.raise_()
         window.activateWindow()
@@ -3411,6 +3546,71 @@ class InferenceWindow(QMainWindow):
         )
         self._refresh_tile(self.focused_source)
 
+    def _update_live_header_toggle_button(self) -> None:
+        if not hasattr(self, "live_header_toggle_btn") or self.live_header_toggle_btn is None:
+            return
+        if self.live_tile_header_visible:
+            self.live_header_toggle_btn.setText("◂")
+            self.live_header_toggle_btn.setToolTip("Ukryj gorny pasek informacji nad kafelkami kamer.")
+        else:
+            self.live_header_toggle_btn.setText("▸")
+            self.live_header_toggle_btn.setToolTip("Pokaz gorny pasek informacji nad kafelkami kamer.")
+
+    def _update_navigation_toggle_button(self) -> None:
+        if not hasattr(self, "navigation_toggle_btn") or self.navigation_toggle_btn is None:
+            return
+        if self.navigation_tabs_visible:
+            text = "▴"
+            tooltip = "Ukryj gorne zakladki aplikacji oraz podzakladki Live/Nagrania."
+        else:
+            text = "▾"
+            tooltip = "Pokaz gorne zakladki aplikacji oraz podzakladki Live/Nagrania."
+        self.navigation_toggle_btn.setText(text)
+        self.navigation_toggle_btn.setToolTip(tooltip)
+        if hasattr(self, "navigation_overlay_btn") and self.navigation_overlay_btn is not None:
+            self.navigation_overlay_btn.setText(text)
+            self.navigation_overlay_btn.setToolTip(tooltip)
+
+    def _set_navigation_tabs_visibility(self, visible: bool, *, persist: bool) -> None:
+        visible = bool(visible)
+        self.navigation_tabs_visible = visible
+        self.main_tabs.tabBar().setVisible(visible)
+        if hasattr(self, "preview_tabs") and self.preview_tabs is not None:
+            self.preview_tabs.tabBar().setVisible(visible)
+        if hasattr(self, "navigation_corner_widget") and self.navigation_corner_widget is not None:
+            self.navigation_corner_widget.setVisible(visible)
+        if hasattr(self, "navigation_overlay_btn") and self.navigation_overlay_btn is not None:
+            self.navigation_overlay_btn.setVisible(not visible)
+        self._update_navigation_toggle_button()
+        self._position_overlay_controls()
+
+        if persist:
+            self._persist_config(show_message=False)
+
+    def _toggle_navigation_tabs_visibility(self) -> None:
+        self._set_navigation_tabs_visibility(not self.navigation_tabs_visible, persist=True)
+
+    def _set_live_tile_header_visibility(self, visible: bool, *, persist: bool) -> None:
+        visible = bool(visible)
+        if self.live_tile_header_visible == visible:
+            self._update_live_header_toggle_button()
+            return
+
+        self.live_tile_header_visible = visible
+        for tile in self.tiles.values():
+            tile.set_header_visibility(visible)
+        self._update_live_header_toggle_button()
+        self._position_overlay_controls()
+
+        if self.focused_source:
+            self._refresh_tile(self.focused_source)
+
+        if persist:
+            self._persist_config(show_message=False)
+
+    def _toggle_live_tile_header_visibility(self) -> None:
+        self._set_live_tile_header_visibility(not self.live_tile_header_visible, persist=True)
+
     def _toggle_live_controls_panel(self) -> None:
         if hasattr(self, "preview_tabs") and self.preview_tabs.currentIndex() != 0:
             return
@@ -3425,6 +3625,8 @@ class InferenceWindow(QMainWindow):
             return
         is_live = int(index) == 0
         self.live_controls_toggle_btn.setVisible(is_live)
+        if hasattr(self, "live_header_toggle_btn") and self.live_header_toggle_btn is not None:
+            self.live_header_toggle_btn.setVisible(is_live)
         if not is_live:
             self.live_controls_panel.hide()
             self.live_controls_toggle_btn.setText("⚙")
@@ -3437,7 +3639,7 @@ class InferenceWindow(QMainWindow):
 
     def _position_overlay_controls(self) -> None:
         side_margin = 10
-        top_margin = 0
+        top_margin = 6
 
         if hasattr(self, "exit_app_btn") and self.exit_app_btn is not None:
             parent = self.exit_app_btn.parentWidget()
@@ -3446,6 +3648,14 @@ class InferenceWindow(QMainWindow):
                 y = top_margin
                 self.exit_app_btn.move(x, y)
                 self.exit_app_btn.raise_()
+
+        if (
+            hasattr(self, "navigation_overlay_btn")
+            and self.navigation_overlay_btn is not None
+            and self.navigation_overlay_btn.isVisible()
+        ):
+            self.navigation_overlay_btn.move(0, 2)
+            self.navigation_overlay_btn.raise_()
 
         if (
             hasattr(self, "preview_tabs")
@@ -3457,11 +3667,26 @@ class InferenceWindow(QMainWindow):
                 return
 
             tab_bar = container.tabBar()
+            controls_y = side_margin
+            if tab_bar.isVisible():
+                controls_y = max(side_margin, tab_bar.geometry().bottom() + 8)
+            elif hasattr(self, "navigation_overlay_btn") and self.navigation_overlay_btn is not None:
+                controls_y = max(
+                    controls_y,
+                    self.navigation_overlay_btn.y() + self.navigation_overlay_btn.height() + 8,
+                )
+
             toggle_h = self.live_controls_toggle_btn.height()
             toggle_x = max(side_margin, container.width() - self.live_controls_toggle_btn.width() - side_margin)
-            toggle_y = max(1, tab_bar.geometry().top() + 2)
+            toggle_y = controls_y
             self.live_controls_toggle_btn.move(toggle_x, toggle_y)
             self.live_controls_toggle_btn.raise_()
+
+            if hasattr(self, "live_header_toggle_btn") and self.live_header_toggle_btn is not None:
+                header_toggle_x = side_margin
+                header_toggle_y = toggle_y
+                self.live_header_toggle_btn.move(header_toggle_x, header_toggle_y)
+                self.live_header_toggle_btn.raise_()
 
             if self.live_controls_panel.isVisible():
                 self.live_controls_panel.adjustSize()
@@ -3489,7 +3714,6 @@ class InferenceWindow(QMainWindow):
         if updated <= 1.01:
             self.pan_offsets[self.focused_source] = (0.0, 0.0)
 
-        self.zoom_label.setText(f"Zoom: {updated:.2f}x")
         self._refresh_tile(self.focused_source)
 
     def _reset_focus_zoom(self) -> None:
@@ -3497,7 +3721,6 @@ class InferenceWindow(QMainWindow):
             return
         self.zoom_levels[self.focused_source] = 1.0
         self.pan_offsets[self.focused_source] = (0.0, 0.0)
-        self.zoom_label.setText("Zoom: 1.00x")
         self._refresh_tile(self.focused_source)
 
     def _on_tile_pan_delta(self, source_name: str, dx: float, dy: float) -> None:
@@ -3646,6 +3869,7 @@ class InferenceWindow(QMainWindow):
                     f"expected={len(source_batch)} got={len(batch_results)}"
                 )
 
+            mode = resolve_security_mode(self.security_cfg)
             for idx in range(count):
                 source_name = source_batch[idx]
                 frame = frame_batch[idx]
@@ -3653,7 +3877,6 @@ class InferenceWindow(QMainWindow):
                 boxes = self._extract_tracked_person_boxes(source_name, None, result, frame)
                 tracked_ids = {box[5] for box in boxes if len(box) >= 6 and box[5] is not None}
                 person_count = len(tracked_ids) if tracked_ids else len(boxes)
-                mode = resolve_security_mode(self.security_cfg)
                 alert = should_raise_alert(person_count, mode, self.security_cfg)
                 payload = AsyncInferenceResult(
                     infer_ts=now,
@@ -4266,29 +4489,8 @@ class InferenceWindow(QMainWindow):
 
         if self.focused_source == source_name and self.fullscreen_window is not None and self.fullscreen_window.isVisible():
             self.fullscreen_window.set_source_name(source_name)
-            self.fullscreen_window.set_frame(runtime.last_output, zoom=zoom, pan_x=pan_x, pan_y=pan_y)
-
-    def _choose_sources_for_inference(
-        self,
-        source_names: list[str],
-        infer_due: dict[str, bool],
-    ) -> set[str]:
-        if not source_names:
-            return set()
-
-        total = len(source_names)
-        start = self._infer_rr_cursor % total
-        ordered = [source_names[(start + idx) % total] for idx in range(total)]
-        self._infer_rr_cursor = (start + 1) % total
-
-        selected: list[str] = []
-        for source_name in ordered:
-            if not infer_due.get(source_name, False):
-                continue
-            selected.append(source_name)
-            if len(selected) >= self.max_infer_per_tick:
-                break
-        return set(selected)
+            fullscreen_frame = self._build_fullscreen_display_frame(source_name, runtime.last_output)
+            self.fullscreen_window.set_frame(fullscreen_frame, zoom=zoom, pan_x=pan_x, pan_y=pan_y)
 
     def _tick_live(self) -> None:
         now_ts = time.perf_counter()
@@ -4392,9 +4594,10 @@ class InferenceWindow(QMainWindow):
         if self.live_running:
             return
 
+        self._flush_pending_settings()
         self._apply_controls_to_runtime_state()
+        ensure_windows_compile_env(self.inference_cfg, compile_value=self.inference_cfg.get("compile", False))
         self._rebuild_predict_kwargs()
-        self._infer_rr_cursor = 0
         with self._infer_lock:
             self._infer_last_submit_ts.clear()
         self._start_inference_worker()
@@ -4897,6 +5100,7 @@ class InferenceWindow(QMainWindow):
             self._event_writer_stop = False
             self._event_writer_queue.clear()
             self._event_writer_pending.clear()
+            self._event_writer_drop_notice_ts.clear()
         self._event_writer_thread = threading.Thread(
             target=self._event_writer_loop,
             name="event-clip-writer",
@@ -4915,6 +5119,7 @@ class InferenceWindow(QMainWindow):
         with self._event_writer_cond:
             self._event_writer_queue.clear()
             self._event_writer_pending.clear()
+            self._event_writer_drop_notice_ts.clear()
 
     def _event_writer_loop(self) -> None:
         while True:
@@ -4947,13 +5152,52 @@ class InferenceWindow(QMainWindow):
                     self._event_writer_pending[key] = pending - 1
                 self._event_writer_cond.notify_all()
 
+    def _drop_oldest_event_frame_locked(self, source_name: str, generation: int) -> bool:
+        if not self._event_writer_queue:
+            return False
+
+        updated_queue: deque[tuple[str, int, np.ndarray]] = deque()
+        removed = False
+        while self._event_writer_queue:
+            queued_source, queued_generation, queued_frame = self._event_writer_queue.popleft()
+            if not removed and queued_source == source_name and queued_generation == generation:
+                removed = True
+                continue
+            updated_queue.append((queued_source, queued_generation, queued_frame))
+        self._event_writer_queue = updated_queue
+        return removed
+
     def _enqueue_event_clip_frame(self, source_name: str, runtime: SourceRuntime, frame: np.ndarray) -> None:
         generation = int(runtime.event_clip_generation)
         key = (source_name, generation)
+        should_log_drop = False
         with self._event_writer_cond:
+            pending = int(self._event_writer_pending.get(key, 0))
+            increment_pending = True
+            if pending >= self._event_writer_max_pending_frames:
+                dropped = self._drop_oldest_event_frame_locked(source_name, generation)
+                if not dropped:
+                    last_notice_ts = float(self._event_writer_drop_notice_ts.get(source_name, 0.0))
+                    now_ts = time.perf_counter()
+                    if now_ts - last_notice_ts >= 2.0:
+                        self._event_writer_drop_notice_ts[source_name] = now_ts
+                        should_log_drop = True
+                    return
+                increment_pending = False
+                last_notice_ts = float(self._event_writer_drop_notice_ts.get(source_name, 0.0))
+                now_ts = time.perf_counter()
+                if now_ts - last_notice_ts >= 2.0:
+                    self._event_writer_drop_notice_ts[source_name] = now_ts
+                    should_log_drop = True
+
             self._event_writer_queue.append((source_name, generation, frame.copy()))
-            self._event_writer_pending[key] = int(self._event_writer_pending.get(key, 0)) + 1
+            if increment_pending:
+                self._event_writer_pending[key] = pending + 1
             self._event_writer_cond.notify()
+        if should_log_drop:
+            self._queue_async_notice(
+                f"[warn] event clip queue full for '{source_name}', dropping stale frames to keep UI responsive"
+            )
 
     def _wait_for_event_clip_flush(self, source_name: str, generation: int, timeout_sec: float = 0.35) -> None:
         key = (source_name, int(generation))
@@ -5190,6 +5434,9 @@ class InferenceWindow(QMainWindow):
     # ---------- logs ----------
     def _clear_logs(self) -> None:
         self._log_entries.clear()
+        self._pending_log_lines.clear()
+        if self._log_flush_timer.isActive():
+            self._log_flush_timer.stop()
         self.logs_text.clear()
         self._log("Logs cleared.")
 
@@ -5240,6 +5487,8 @@ class InferenceWindow(QMainWindow):
         self.runtime_cfg["model_target_fps"] = float(self.model_target_fps)
         self.runtime_cfg["max_infer_per_tick"] = int(self.max_infer_per_tick)
         self.runtime_cfg["live_tile_spacing"] = int(self.live_tile_spacing)
+        self.runtime_cfg["show_live_tile_headers"] = bool(self.live_tile_header_visible)
+        self.runtime_cfg["show_navigation_tabs"] = bool(self.navigation_tabs_visible)
         self.runtime_cfg["console_logs"] = bool(self.console_logs_enabled)
         self.runtime_cfg["suppress_opencv_warnings"] = bool(self.suppress_opencv_warnings)
         self.runtime_cfg["auto_scan_cameras_on_startup"] = bool(self.auto_scan_cameras_on_startup)
@@ -5316,6 +5565,8 @@ class InferenceWindow(QMainWindow):
         if event.type() == QEvent.Type.Resize:
             if watched is self.live_scroll.viewport():
                 self._rebuild_live_layout()
+            elif watched is self.main_tabs or watched is self.main_tabs.tabBar():
+                self._position_overlay_controls()
             elif (
                 watched is self.live_view_container
                 or watched is self.preview_tabs
@@ -5336,6 +5587,7 @@ class InferenceWindow(QMainWindow):
         super().keyPressEvent(event)
 
     def closeEvent(self, event: Any) -> None:  # noqa: ANN401
+        self._flush_pending_settings()
         self._close_fullscreen_source()
         self.stop_live()
         self._stop_inference_worker()
