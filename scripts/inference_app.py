@@ -3,6 +3,7 @@
 import argparse
 from collections import deque
 import csv
+from datetime import datetime
 import importlib.util
 import json
 import math
@@ -21,13 +22,14 @@ import cv2
 import numpy as np
 from ultralytics import YOLO
 
-from PyQt6.QtCore import QEvent, QPoint, QPointF, QRectF, QSize, Qt, QTimer, pyqtSignal
-from PyQt6.QtGui import QColor, QImage, QPainter, QPalette, QPen, QPixmap, QPolygonF, QTextCursor
+from PyQt6.QtCore import QDate, QEvent, QPoint, QPointF, QRectF, QSize, Qt, QTime, QTimer, pyqtSignal
+from PyQt6.QtGui import QColor, QImage, QPainter, QPalette, QPen, QPixmap, QPolygonF, QTextCursor, QStandardItem
 from PyQt6.QtWidgets import (
     QApplication,
     QAbstractItemView,
     QCheckBox,
     QComboBox,
+    QDateEdit,
     QDoubleSpinBox,
     QFileDialog,
     QFrame,
@@ -52,6 +54,7 @@ from PyQt6.QtWidgets import (
     QTableWidget,
     QTableWidgetItem,
     QTextEdit,
+    QTimeEdit,
     QVBoxLayout,
     QWidget,
 )
@@ -73,6 +76,45 @@ TrackedBox = tuple[int, int, int, int, float, int | None]
 EVENT_IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".bmp"}
 EVENT_VIDEO_SUFFIXES = {".mp4", ".avi", ".mkv", ".mov", ".wmv", ".m4v"}
 QIMAGE_BGR888 = getattr(QImage.Format, "Format_BGR888", None)
+
+YOLO_PROFILE_PRESETS: dict[str, dict[str, Any]] = {
+    "low": {
+        "title": "Low",
+        "combo_label": "Low - szybki i lekki",
+        "description": "Najlepszy dla slabszego sprzetu lub wielu kamer jednoczesnie.",
+        "model_name": "yolo26n.pt",
+        "target_fps": 30.0,
+        "conf": 0.24,
+        "iou": 0.40,
+        "imgsz": 640,
+        "max_det": 40,
+    },
+    "medium": {
+        "title": "Medium",
+        "combo_label": "Medium - balans",
+        "description": "Dobry kompromis miedzy dokladnoscia i plynnoscia na przecietnym GPU.",
+        "model_name": "yolo26s.pt",
+        "target_fps": 20.0,
+        "conf": 0.27,
+        "iou": 0.42,
+        "imgsz": 960,
+        "max_det": 50,
+    },
+    "high": {
+        "title": "High",
+        "combo_label": "High - dokladnosc",
+        "description": "Lepsza jakosc detekcji kosztem szybkosci, dobra dla mocniejszego sprzetu.",
+        "model_name": "yolo26m.pt",
+        "target_fps": 12.0,
+        "conf": 0.30,
+        "iou": 0.45,
+        "imgsz": 1280,
+        "max_det": 60,
+    },
+}
+
+YOLO_PROFILE_CUSTOM = "custom"
+YOLO_IMGSZ_OPTIONS = [512, 640, 736, 960, 1024, 1280, 1536]
 
 
 def _is_compile_enabled(value: Any) -> bool:
@@ -1525,6 +1567,9 @@ class InferenceWindow(QMainWindow):
             row_layout.addStretch(1)
             return row, btn
 
+        top_settings_row = QHBoxLayout()
+        top_settings_row.setSpacing(10)
+
         security_box = QGroupBox("Reguly alarmu (dzien / noc)")
         security_box.setStyleSheet(settings_box_style)
         security_grid = QGridLayout(security_box)
@@ -1548,16 +1593,31 @@ class InferenceWindow(QMainWindow):
         security_grid.addWidget(self.night_start_spin, 1, 1)
         security_grid.addWidget(QLabel("Noc do (godzina):"), 2, 0)
         security_grid.addWidget(self.night_end_spin, 2, 1)
-        security_grid.addWidget(QLabel("Prog alarmu w dzien (osoby):"), 3, 0)
+        security_grid.addWidget(QLabel("Ilosc osob do uruchomienia alarmu w dzien:"), 3, 0)
         security_grid.addWidget(self.day_threshold_spin, 3, 1)
-        security_grid.addWidget(QLabel("Prog alarmu w nocy (osoby):"), 4, 0)
+        security_grid.addWidget(QLabel("Ilosc osob do uruchomienia alarmu w nocy:"), 4, 0)
         security_grid.addWidget(self.night_threshold_spin, 4, 1)
+        top_settings_row.addWidget(security_box, stretch=1)
 
-        layout.addWidget(security_box)
-
-        inference_box = QGroupBox("Parametry detekcji YOLO")
+        inference_box = QGroupBox("Profil detekcji YOLO")
         inference_box.setStyleSheet(settings_box_style)
-        inference_grid = QGridLayout(inference_box)
+        inference_layout = QHBoxLayout(inference_box)
+        inference_layout.setContentsMargins(12, 12, 12, 12)
+        inference_layout.setSpacing(16)
+
+        self.yolo_profile_combo = QComboBox()
+        self.yolo_profile_combo.setMaxVisibleItems(len(YOLO_PROFILE_PRESETS) + 1)
+        for profile_key, preset in YOLO_PROFILE_PRESETS.items():
+            self.yolo_profile_combo.addItem(str(preset["combo_label"]), profile_key)
+        self.yolo_profile_combo.addItem("Custom - reczne ustawienia", YOLO_PROFILE_CUSTOM)
+
+        self.yolo_model_combo = QComboBox()
+        self.yolo_model_combo.setMaxVisibleItems(20)
+
+        self.model_target_fps_spin = QDoubleSpinBox()
+        self.model_target_fps_spin.setRange(1.0, 60.0)
+        self.model_target_fps_spin.setSingleStep(1.0)
+        self.model_target_fps_spin.setDecimals(1)
 
         self.conf_spin = QDoubleSpinBox()
         self.conf_spin.setRange(0.01, 0.99)
@@ -1569,33 +1629,62 @@ class InferenceWindow(QMainWindow):
         self.iou_spin.setSingleStep(0.01)
         self.iou_spin.setDecimals(2)
 
-        self.imgsz_spin = QSpinBox()
-        self.imgsz_spin.setRange(320, 1920)
-        self.imgsz_spin.setSingleStep(32)
+        self.imgsz_combo = QComboBox()
+        self.imgsz_combo.setMaxVisibleItems(len(YOLO_IMGSZ_OPTIONS))
+        for imgsz_value in YOLO_IMGSZ_OPTIONS:
+            self.imgsz_combo.addItem(f"{imgsz_value} px", imgsz_value)
 
         self.max_det_spin = QSpinBox()
         self.max_det_spin.setRange(1, 1000)
 
         self.device_edit = QLineEdit()
+        self.device_edit.setPlaceholderText("auto / 0 / cpu")
         half_row, self.half_checkbox = _make_toggle_row("FP16 (half precision)")
         compile_row, self.compile_checkbox = _make_toggle_row("torch.compile (jesli stabilne)")
         startmax_row, self.start_maximized_checkbox = _make_toggle_row("Start aplikacji w trybie zmaksymalizowanym")
+        self.yolo_profile_help_label = QLabel("")
+        self.yolo_profile_help_label.setWordWrap(True)
+        self.yolo_profile_help_label.setStyleSheet("color: #9fb0c9;")
+        self.yolo_profile_summary_label = QLabel("")
+        self.yolo_profile_summary_label.setWordWrap(True)
+        self.yolo_profile_summary_label.setStyleSheet("color: #d8d8d8;")
 
-        inference_grid.addWidget(QLabel("Prog pewnosci (conf):"), 0, 0)
-        inference_grid.addWidget(self.conf_spin, 0, 1)
-        inference_grid.addWidget(QLabel("Prog IOU (NMS):"), 1, 0)
-        inference_grid.addWidget(self.iou_spin, 1, 1)
-        inference_grid.addWidget(QLabel("Rozmiar wejscia (imgsz):"), 2, 0)
-        inference_grid.addWidget(self.imgsz_spin, 2, 1)
-        inference_grid.addWidget(QLabel("Maks. liczba detekcji:"), 3, 0)
-        inference_grid.addWidget(self.max_det_spin, 3, 1)
-        inference_grid.addWidget(QLabel("Urzadzenie (np. 0/cpu):"), 4, 0)
-        inference_grid.addWidget(self.device_edit, 4, 1)
-        inference_grid.addWidget(half_row, 5, 0, 1, 2)
-        inference_grid.addWidget(compile_row, 6, 0, 1, 2)
-        inference_grid.addWidget(startmax_row, 7, 0, 1, 2)
+        inference_left_widget = QWidget()
+        inference_left_grid = QGridLayout(inference_left_widget)
+        inference_left_grid.setContentsMargins(0, 0, 0, 0)
+        inference_left_grid.setHorizontalSpacing(10)
+        inference_left_grid.setVerticalSpacing(8)
+        inference_left_grid.addWidget(QLabel("Preset:"), 0, 0)
+        inference_left_grid.addWidget(self.yolo_profile_combo, 0, 1)
+        inference_left_grid.addWidget(QLabel("Model YOLO:"), 1, 0)
+        inference_left_grid.addWidget(self.yolo_model_combo, 1, 1)
+        inference_left_grid.addWidget(QLabel("FPS modelu:"), 2, 0)
+        inference_left_grid.addWidget(self.model_target_fps_spin, 2, 1)
+        inference_left_grid.addWidget(QLabel("Urzadzenie:"), 3, 0)
+        inference_left_grid.addWidget(self.device_edit, 3, 1)
+        inference_left_grid.addWidget(self.yolo_profile_help_label, 4, 0, 1, 2)
+        inference_left_grid.addWidget(self.yolo_profile_summary_label, 5, 0, 1, 2)
+        inference_left_grid.addWidget(half_row, 6, 0, 1, 2)
+        inference_left_grid.addWidget(compile_row, 7, 0, 1, 2)
+        inference_left_grid.addWidget(startmax_row, 8, 0, 1, 2)
 
-        layout.addWidget(inference_box)
+        inference_right_widget = QWidget()
+        inference_right_grid = QGridLayout(inference_right_widget)
+        inference_right_grid.setContentsMargins(0, 0, 0, 0)
+        inference_right_grid.setHorizontalSpacing(10)
+        inference_right_grid.setVerticalSpacing(8)
+        inference_right_grid.addWidget(QLabel("Rozdzielczosc modelu:"), 0, 0)
+        inference_right_grid.addWidget(self.imgsz_combo, 0, 1)
+        inference_right_grid.addWidget(QLabel("Prog pewnosci (conf):"), 1, 0)
+        inference_right_grid.addWidget(self.conf_spin, 1, 1)
+        inference_right_grid.addWidget(QLabel("Prog IOU (NMS):"), 2, 0)
+        inference_right_grid.addWidget(self.iou_spin, 2, 1)
+        inference_right_grid.addWidget(QLabel("Maks. liczba detekcji:"), 3, 0)
+        inference_right_grid.addWidget(self.max_det_spin, 3, 1)
+        inference_right_grid.setRowStretch(4, 1)
+
+        inference_layout.addWidget(inference_left_widget, stretch=11)
+        inference_layout.addWidget(inference_right_widget, stretch=9)
 
         events_box = QGroupBox("Archiwizacja zdarzen")
         events_box.setStyleSheet(settings_box_style)
@@ -1660,18 +1749,17 @@ class InferenceWindow(QMainWindow):
         events_grid.addWidget(QLabel("Folder zapisu zdarzen:"), 8, 0)
         events_grid.addWidget(output_row_widget, 8, 1)
 
-        layout.addWidget(events_box)
+        top_settings_row.addWidget(events_box, stretch=1)
+        layout.addLayout(top_settings_row)
+        layout.addWidget(inference_box)
 
-        model_box = QGroupBox("Wybor modelu")
+        model_box = QGroupBox("Zaawansowany wybor modelu")
         model_box.setStyleSheet(settings_box_style)
         model_layout = QVBoxLayout(model_box)
 
-        self.current_model_label = QLabel("Aktualny model: -")
-        self.current_model_label.setWordWrap(True)
-        self.current_model_label.setStyleSheet("color: #d8d8d8;")
-        model_layout.addWidget(self.current_model_label)
-
         self.model_help_label = QLabel(
+            "Na co dzien uzywaj presetu wyzej. "
+            "Tutaj mozesz recznie wymusic konkretny model. "
             "Base = surowe wagi (np. yolo26n.pt), "
             "trained/latest = ostatni best/last z treningu, "
             "trained/final = najlepszy model utrwalony per architektura."
@@ -2115,20 +2203,82 @@ class InferenceWindow(QMainWindow):
         layout = QVBoxLayout(page)
         layout.setSpacing(8)
 
-        self.events_table = QTableWidget(0, 6)
-        self.events_table.setHorizontalHeaderLabels(["Time", "Source", "Mode", "Persons", "Visible[s]", "File"])
+        filters_box = QGroupBox("Filtry wykrytego ruchu")
+        filters_layout = QGridLayout(filters_box)
+
+        self.events_period_combo = QComboBox()
+        self.events_camera_combo = QComboBox()
+        self.events_mode_combo = QComboBox()
+        self.events_mode_combo.addItem("Wszystkie tryby", "all")
+        self.events_mode_combo.addItem("Tylko dzien", "day")
+        self.events_mode_combo.addItem("Tylko noc", "night")
+
+        self.events_exact_day_checkbox = QCheckBox("Konkretny dzien")
+        self.events_exact_day_edit = QDateEdit()
+        self.events_exact_day_edit.setCalendarPopup(True)
+        self.events_exact_day_edit.setDisplayFormat("yyyy-MM-dd")
+        self.events_exact_day_edit.setDate(QDate.currentDate())
+        self.events_exact_day_edit.setKeyboardTracking(False)
+        self.events_hour_filter_checkbox = QCheckBox("Konkretne godziny")
+        self.events_hour_from_edit = QTimeEdit()
+        self.events_hour_from_edit.setDisplayFormat("HH:mm")
+        self.events_hour_from_edit.setTime(QTime(0, 0))
+        self.events_hour_from_edit.setKeyboardTracking(False)
+        self.events_hour_to_edit = QTimeEdit()
+        self.events_hour_to_edit.setDisplayFormat("HH:mm")
+        self.events_hour_to_edit.setTime(QTime(23, 59))
+        self.events_hour_to_edit.setKeyboardTracking(False)
+
+        filters_layout.addWidget(QLabel("Okres:"), 0, 0)
+        filters_layout.addWidget(self.events_period_combo, 0, 1)
+        filters_layout.addWidget(QLabel("Kamera:"), 0, 2)
+        filters_layout.addWidget(self.events_camera_combo, 0, 3)
+        filters_layout.addWidget(QLabel("Tryb:"), 1, 0)
+        filters_layout.addWidget(self.events_mode_combo, 1, 1)
+        filters_layout.addWidget(self.events_exact_day_checkbox, 1, 2)
+        filters_layout.addWidget(self.events_exact_day_edit, 1, 3)
+        filters_layout.addWidget(self.events_hour_filter_checkbox, 2, 0)
+        filters_layout.addWidget(self.events_hour_from_edit, 2, 1)
+        filters_layout.addWidget(QLabel("do"), 2, 2)
+        filters_layout.addWidget(self.events_hour_to_edit, 2, 3)
+
+        layout.addWidget(filters_box)
+
+        self.events_table = QTableWidget(0, 7)
+        self.events_table.setHorizontalHeaderLabels(["Data", "Godzina", "Kamera", "Tryb", "Osoby", "Widocznosc[s]", "Plik"])
         self.events_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.events_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.events_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.events_table.verticalHeader().setVisible(False)
         self.events_table.itemSelectionChanged.connect(self._on_event_table_selection_changed)
+        self.events_table.setStyleSheet(
+            "QHeaderView::section {"
+            "background-color: #202838;"
+            "color: #eef3fb;"
+            "font-size: 15px;"
+            "font-weight: 700;"
+            "padding: 8px 6px;"
+            "border: 1px solid #334155;"
+            "}"
+        )
         events_header = self.events_table.horizontalHeader()
-        events_header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
-        events_header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
-        events_header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
-        events_header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
-        events_header.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
-        events_header.setSectionResizeMode(5, QHeaderView.ResizeMode.Stretch)
+        events_header.setSectionResizeMode(0, QHeaderView.ResizeMode.Interactive)
+        events_header.setSectionResizeMode(1, QHeaderView.ResizeMode.Interactive)
+        events_header.setSectionResizeMode(2, QHeaderView.ResizeMode.Interactive)
+        events_header.setSectionResizeMode(3, QHeaderView.ResizeMode.Interactive)
+        events_header.setSectionResizeMode(4, QHeaderView.ResizeMode.Interactive)
+        events_header.setSectionResizeMode(5, QHeaderView.ResizeMode.Interactive)
+        events_header.setSectionResizeMode(6, QHeaderView.ResizeMode.Stretch)
+        self.events_table.setColumnWidth(0, 118)
+        self.events_table.setColumnWidth(1, 92)
+        self.events_table.setColumnWidth(2, 170)
+        self.events_table.setColumnWidth(3, 78)
+        self.events_table.setColumnWidth(4, 68)
+        self.events_table.setColumnWidth(5, 140)
+
+        self._events_filter_timer = QTimer(self)
+        self._events_filter_timer.setSingleShot(True)
+        self._events_filter_timer.timeout.connect(self._refresh_events_table)
 
         self.events_preview = VideoCanvas("event")
         self.events_preview.clicked.connect(self._noop_click)
@@ -2158,8 +2308,21 @@ class InferenceWindow(QMainWindow):
         controls.addStretch(1)
         controls.addWidget(self.events_status_label)
 
+        self.events_period_combo.currentIndexChanged.connect(self._schedule_events_table_refresh)
+        self.events_camera_combo.currentIndexChanged.connect(self._schedule_events_table_refresh)
+        self.events_mode_combo.currentIndexChanged.connect(self._schedule_events_table_refresh)
+        self.events_exact_day_checkbox.toggled.connect(self._schedule_events_table_refresh)
+        self.events_exact_day_edit.dateChanged.connect(self._schedule_events_table_refresh)
+        self.events_exact_day_edit.editingFinished.connect(self._schedule_events_table_refresh)
+        self.events_hour_filter_checkbox.toggled.connect(self._schedule_events_table_refresh)
+        self.events_hour_from_edit.timeChanged.connect(self._schedule_events_table_refresh)
+        self.events_hour_to_edit.timeChanged.connect(self._schedule_events_table_refresh)
+        self.events_hour_from_edit.editingFinished.connect(self._schedule_events_table_refresh)
+        self.events_hour_to_edit.editingFinished.connect(self._schedule_events_table_refresh)
+
         layout.addWidget(splitter, stretch=1)
         layout.addLayout(controls)
+        self._refresh_events_filter_controls()
         self._refresh_events_table()
         return page
 
@@ -2189,6 +2352,286 @@ class InferenceWindow(QMainWindow):
 
         return page
 
+    def _infer_yolo_profile_key(self) -> str:
+        model_name = str(self.model_cfg.get("name", "")).strip()
+        target_fps = float(self.runtime_cfg.get("model_target_fps", self.model_target_fps))
+        imgsz_value = int(self.inference_cfg.get("imgsz", 960))
+        conf_value = float(self.inference_cfg.get("conf", 0.35))
+        iou_value = float(self.inference_cfg.get("iou", 0.45))
+        max_det_value = int(self.inference_cfg.get("max_det", 100))
+        return self._match_yolo_profile(
+            model_name=model_name,
+            target_fps=target_fps,
+            conf_value=conf_value,
+            iou_value=iou_value,
+            imgsz_value=imgsz_value,
+            max_det_value=max_det_value,
+        )
+
+    def _match_yolo_profile(
+        self,
+        *,
+        model_name: str,
+        target_fps: float,
+        conf_value: float,
+        iou_value: float,
+        imgsz_value: int,
+        max_det_value: int,
+    ) -> str:
+        normalized_model = str(model_name or "").strip().lower()
+        for profile_key, preset in YOLO_PROFILE_PRESETS.items():
+            if (
+                normalized_model == str(preset["model_name"]).strip().lower()
+                and abs(float(target_fps) - float(preset["target_fps"])) < 0.0001
+                and abs(float(conf_value) - float(preset["conf"])) < 0.0001
+                and abs(float(iou_value) - float(preset["iou"])) < 0.0001
+                and int(imgsz_value) == int(preset["imgsz"])
+                and int(max_det_value) == int(preset["max_det"])
+            ):
+                return profile_key
+        return YOLO_PROFILE_CUSTOM
+
+    def _set_combo_to_data(self, combo: QComboBox, data_value: Any, *, fallback_index: int = 0) -> None:
+        index = combo.findData(data_value)
+        combo.setCurrentIndex(fallback_index if index < 0 else index)
+
+    def _build_model_selection(self, entry: dict[str, Any]) -> dict[str, str]:
+        model_name = str(entry.get("model_name", entry.get("name", ""))).strip()
+        selected_model_path = ""
+        try:
+            path_value = Path(entry.get("path", ""))
+            if path_value.exists():
+                selected_model_path = _to_relative_or_abs(path_value.resolve())
+        except Exception:  # noqa: BLE001
+            selected_model_path = str(entry.get("path_display", "")).strip()
+        return {
+            "model_name": model_name,
+            "selected_model_path": selected_model_path,
+        }
+
+    def _current_yolo_model_selection(self) -> dict[str, str]:
+        data_value = self.yolo_model_combo.currentData()
+        if isinstance(data_value, dict):
+            return {
+                "model_name": str(data_value.get("model_name", "")).strip(),
+                "selected_model_path": str(data_value.get("selected_model_path", "")).strip(),
+            }
+        return {
+            "model_name": str(self.model_cfg.get("name", "")).strip(),
+            "selected_model_path": str(self.model_cfg.get("selected_model_path", "")).strip(),
+        }
+
+    def _populate_yolo_model_combo(self) -> None:
+        if not hasattr(self, "yolo_model_combo") or self.yolo_model_combo is None:
+            return
+
+        current_selection = self._current_yolo_model_selection()
+        combo_model = self.yolo_model_combo.model()
+        self.yolo_model_combo.clear()
+
+        installed_entries = [entry for entry in self.model_catalog if not bool(entry.get("missing", False))]
+        recommended_entries: list[dict[str, Any]] = []
+        older_entries: list[dict[str, Any]] = []
+        for entry in installed_entries:
+            family = str(entry.get("family", "")).strip().lower()
+            kind = str(entry.get("kind", "")).strip().lower()
+            if family.startswith("yolo26") or kind.startswith("trained"):
+                recommended_entries.append(entry)
+            else:
+                older_entries.append(entry)
+
+        def _sort_key(entry: dict[str, Any]) -> tuple[str, str, str]:
+            return (
+                str(entry.get("family", "")),
+                str(entry.get("kind", "")),
+                str(entry.get("display_name", "")),
+            )
+
+        recommended_entries.sort(key=_sort_key)
+        older_entries.sort(key=_sort_key)
+
+        def _add_section(title: str, entries: list[dict[str, Any]]) -> None:
+            if not entries:
+                return
+            self.yolo_model_combo.addItem(title)
+            header_index = self.yolo_model_combo.count() - 1
+            if hasattr(combo_model, "item"):
+                header_item = combo_model.item(header_index)
+                if isinstance(header_item, QStandardItem):
+                    header_item.setEnabled(False)
+                    header_item.setSelectable(False)
+                    header_item.setForeground(QColor("#7d889a"))
+            for entry in entries:
+                label = f"{entry.get('display_name', entry.get('name', '-'))} [{entry.get('kind', 'custom')}]"
+                selection = self._build_model_selection(entry)
+                self.yolo_model_combo.addItem(label, selection)
+
+        _add_section("Zalecane", recommended_entries)
+        _add_section("Starsze", older_entries)
+
+        fallback_selection = current_selection
+        if not fallback_selection["model_name"] and installed_entries:
+            fallback_selection = self._build_model_selection(installed_entries[0])
+        self._set_model_combo_value(fallback_selection)
+
+    def _set_model_combo_value(self, selection: dict[str, str] | str) -> None:
+        if isinstance(selection, str):
+            target_model_name = str(selection).strip()
+            target_path = ""
+        else:
+            target_model_name = str(selection.get("model_name", "")).strip()
+            target_path = str(selection.get("selected_model_path", "")).strip()
+
+        for index in range(self.yolo_model_combo.count()):
+            data_value = self.yolo_model_combo.itemData(index)
+            if not isinstance(data_value, dict):
+                continue
+            candidate_model_name = str(data_value.get("model_name", "")).strip()
+            candidate_path = str(data_value.get("selected_model_path", "")).strip()
+            if target_path and candidate_path == target_path:
+                self.yolo_model_combo.setCurrentIndex(index)
+                return
+            if candidate_model_name == target_model_name and (not target_path or candidate_path == target_path):
+                self.yolo_model_combo.setCurrentIndex(index)
+                return
+
+        for index in range(self.yolo_model_combo.count()):
+            if isinstance(self.yolo_model_combo.itemData(index), dict):
+                self.yolo_model_combo.setCurrentIndex(index)
+                return
+
+    def _set_imgsz_combo_value(self, imgsz_value: int) -> None:
+        label = f"{int(imgsz_value)} px"
+        index = self.imgsz_combo.findData(int(imgsz_value))
+        if index < 0:
+            self.imgsz_combo.addItem(f"{label} (custom)", int(imgsz_value))
+            index = self.imgsz_combo.count() - 1
+        self.imgsz_combo.setCurrentIndex(index)
+
+    def _current_imgsz_value(self) -> int:
+        data_value = self.imgsz_combo.currentData()
+        if data_value is None:
+            return 960
+        return int(data_value)
+
+    def _sync_yolo_profile_combo_from_controls(self) -> None:
+        model_name = self._current_yolo_model_selection()["model_name"]
+        matched_profile = self._match_yolo_profile(
+            model_name=model_name,
+            target_fps=float(self.model_target_fps_spin.value()),
+            conf_value=float(self.conf_spin.value()),
+            iou_value=float(self.iou_spin.value()),
+            imgsz_value=self._current_imgsz_value(),
+            max_det_value=int(self.max_det_spin.value()),
+        )
+        self._suppress_setting_autosave = True
+        try:
+            self._set_combo_to_data(self.yolo_profile_combo, matched_profile)
+        finally:
+            self._suppress_setting_autosave = False
+
+    def _on_yolo_manual_control_changed(self, *_args: Any) -> None:
+        if self._suppress_setting_autosave:
+            return
+        self._sync_yolo_profile_combo_from_controls()
+        self._update_yolo_profile_summary()
+        self._on_setting_changed()
+
+    def _apply_yolo_profile_to_controls(self, profile_key: str) -> None:
+        preset = YOLO_PROFILE_PRESETS.get(profile_key, YOLO_PROFILE_PRESETS["medium"])
+        self._set_model_combo_value({"model_name": str(preset["model_name"]), "selected_model_path": ""})
+        self.model_target_fps_spin.setValue(float(preset["target_fps"]))
+        self.conf_spin.setValue(float(preset["conf"]))
+        self.iou_spin.setValue(float(preset["iou"]))
+        self._set_imgsz_combo_value(int(preset["imgsz"]))
+        self.max_det_spin.setValue(int(preset["max_det"]))
+
+    def _update_yolo_profile_summary(self) -> None:
+        if not hasattr(self, "yolo_profile_combo") or self.yolo_profile_combo is None:
+            return
+
+        profile_key = str(self.yolo_profile_combo.currentData() or self._infer_yolo_profile_key())
+        preset = YOLO_PROFILE_PRESETS.get(profile_key)
+        if preset is None:
+            self.yolo_profile_help_label.setText(
+                "Custom: recznie dopasowany zestaw ustawien. "
+                "Mozesz laczyc lepszy model z nizsza rozdzielczoscia albo mniejszym max_det."
+            )
+        else:
+            self.yolo_profile_help_label.setText(
+                f"{preset['title']}: {preset['description']} Domyslny model: {preset['model_name']}."
+            )
+        current_model_name = self._current_yolo_model_selection()["model_name"]
+        self.yolo_profile_summary_label.setText(
+            "Aplikacja ustawi: "
+            f"model={current_model_name} | conf={self.conf_spin.value():.2f} | "
+            f"IOU={self.iou_spin.value():.2f} | imgsz={self._current_imgsz_value()} | "
+            f"max_det={int(self.max_det_spin.value())} | fps_modelu={self.model_target_fps_spin.value():.1f}"
+        )
+
+    def _on_yolo_profile_changed(self) -> None:
+        if self._suppress_setting_autosave:
+            return
+
+        profile_key = str(self.yolo_profile_combo.currentData() or "").strip().lower()
+        if profile_key == YOLO_PROFILE_CUSTOM:
+            self._update_yolo_profile_summary()
+            self._on_setting_changed()
+            return
+        if profile_key not in YOLO_PROFILE_PRESETS:
+            return
+
+        self._suppress_setting_autosave = True
+        try:
+            self._apply_yolo_profile_to_controls(profile_key)
+        finally:
+            self._suppress_setting_autosave = False
+
+        preset = YOLO_PROFILE_PRESETS[profile_key]
+        self.runtime_cfg["yolo_profile"] = profile_key
+        self.model_cfg["name"] = str(preset["model_name"])
+        self.model_cfg["selected_model_path"] = ""
+        self._update_yolo_profile_summary()
+        self._on_setting_changed()
+
+    def _reload_model_from_config(self) -> None:
+        was_running = self.live_running
+        if was_running:
+            self.stop_live()
+
+        try:
+            self._load_model()
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.critical(self, "Model", f"Nie mozna zaladowac modelu:\n{exc}")
+            if was_running:
+                self.start_live()
+            raise
+
+        self._refresh_model_catalog()
+        self._update_current_model_label()
+        self._update_yolo_profile_summary()
+
+        if was_running:
+            self.start_live()
+
+    def _model_config_requires_reload(self) -> bool:
+        desired_path_raw = str(self.model_cfg.get("selected_model_path", "")).strip()
+        current_loaded_path = self.current_model_path.resolve() if self.current_model_path and self.current_model_path.exists() else None
+        if desired_path_raw:
+            try:
+                desired_path = resolve_path(desired_path_raw).resolve()
+            except Exception:  # noqa: BLE001
+                return True
+            return current_loaded_path is None or desired_path != current_loaded_path
+
+        desired_name = str(self.model_cfg.get("name", "")).strip().lower()
+        current_loaded_name = ""
+        if current_loaded_path is not None:
+            current_loaded_name = current_loaded_path.name.strip().lower()
+        elif self.model_reference:
+            current_loaded_name = Path(str(self.model_reference)).name.strip().lower()
+        return bool(desired_name) and desired_name != current_loaded_name
+
     def _set_controls_from_config(self) -> None:
         self.security_mode_combo.setCurrentText(str(self.security_cfg.get("mode", "auto")))
         self.night_start_spin.setValue(int(self.security_cfg.get("night_start_hour", 22)))
@@ -2198,9 +2641,17 @@ class InferenceWindow(QMainWindow):
 
         self.conf_spin.setValue(float(self.inference_cfg.get("conf", 0.35)))
         self.iou_spin.setValue(float(self.inference_cfg.get("iou", 0.45)))
-        self.imgsz_spin.setValue(int(self.inference_cfg.get("imgsz", 960)))
+        self._populate_yolo_model_combo()
+        self._set_model_combo_value(
+            {
+                "model_name": str(self.model_cfg.get("name", "yolo26s.pt")),
+                "selected_model_path": str(self.model_cfg.get("selected_model_path", "")).strip(),
+            }
+        )
+        self._set_imgsz_combo_value(int(self.inference_cfg.get("imgsz", 960)))
         self.max_det_spin.setValue(int(self.inference_cfg.get("max_det", 100)))
         self.device_edit.setText(str(self.inference_cfg.get("device", "0")))
+        self.model_target_fps_spin.setValue(float(self.runtime_cfg.get("model_target_fps", self.model_target_fps)))
         self.half_checkbox.setChecked(bool(self.inference_cfg.get("half", True)))
         self.compile_checkbox.setChecked(_is_compile_enabled(self.inference_cfg.get("compile", False)))
         self.start_maximized_checkbox.setChecked(bool(self.runtime_cfg.get("start_maximized", True)))
@@ -2214,7 +2665,10 @@ class InferenceWindow(QMainWindow):
         self.events_once_per_streak_checkbox.setChecked(bool(self.events_cfg.get("once_per_streak", True)))
         self.events_output_dir_edit.setText(str(self.events_cfg.get("output_dir", "logs/app/events")))
 
-        self.current_model_label.setText(f"Aktualny model: {self.model_reference}")
+        detected_profile_key = self._infer_yolo_profile_key()
+        self._set_combo_to_data(self.yolo_profile_combo, detected_profile_key)
+        self._update_current_model_label()
+        self._update_yolo_profile_summary()
 
         last_recording = str(self.runtime_cfg.get("last_recording_path", "")).strip()
         if last_recording:
@@ -2229,10 +2683,14 @@ class InferenceWindow(QMainWindow):
         self.night_end_spin.valueChanged.connect(self._on_setting_changed)
         self.day_threshold_spin.valueChanged.connect(self._on_setting_changed)
         self.night_threshold_spin.valueChanged.connect(self._on_setting_changed)
-        self.conf_spin.valueChanged.connect(self._on_setting_changed)
-        self.iou_spin.valueChanged.connect(self._on_setting_changed)
-        self.imgsz_spin.valueChanged.connect(self._on_setting_changed)
-        self.max_det_spin.valueChanged.connect(self._on_setting_changed)
+        self.yolo_profile_combo.currentIndexChanged.connect(self._on_yolo_profile_changed)
+        self.model_target_fps_spin.valueChanged.connect(self._on_setting_changed)
+        self.model_target_fps_spin.valueChanged.connect(self._update_yolo_profile_summary)
+        self.yolo_model_combo.currentIndexChanged.connect(self._on_yolo_manual_control_changed)
+        self.conf_spin.valueChanged.connect(self._on_yolo_manual_control_changed)
+        self.iou_spin.valueChanged.connect(self._on_yolo_manual_control_changed)
+        self.imgsz_combo.currentIndexChanged.connect(self._on_yolo_manual_control_changed)
+        self.max_det_spin.valueChanged.connect(self._on_yolo_manual_control_changed)
         self.device_edit.textChanged.connect(self._on_setting_changed)
         self.half_checkbox.toggled.connect(self._on_setting_changed)
         self.compile_checkbox.toggled.connect(self._on_setting_changed)
@@ -2256,7 +2714,13 @@ class InferenceWindow(QMainWindow):
     def _commit_pending_settings(self) -> None:
         self._apply_controls_to_runtime_state()
         ensure_windows_compile_env(self.inference_cfg, compile_value=self.inference_cfg.get("compile", False))
+        if self._model_config_requires_reload():
+            try:
+                self._reload_model_from_config()
+            except Exception:  # noqa: BLE001
+                return
         self._rebuild_predict_kwargs()
+        self._update_yolo_profile_summary()
         self._persist_config(show_message=False)
 
     def _flush_pending_settings(self) -> None:
@@ -2484,11 +2948,17 @@ class InferenceWindow(QMainWindow):
 
         self.model_catalog = entries
         self._populate_model_table()
+        if hasattr(self, "yolo_model_combo") and self.yolo_model_combo is not None:
+            self._populate_yolo_model_combo()
 
     def _update_current_model_label(self) -> None:
+        if not hasattr(self, "current_model_label") or self.current_model_label is None:
+            self._update_yolo_profile_summary()
+            return
         current_path = self.current_model_path.resolve() if self.current_model_path and self.current_model_path.exists() else None
         if current_path is None:
             self.current_model_label.setText(f"Aktualny model: {self.model_reference}")
+            self._update_yolo_profile_summary()
             return
 
         selected_entry: dict[str, Any] | None = None
@@ -2502,6 +2972,7 @@ class InferenceWindow(QMainWindow):
 
         if selected_entry is None:
             self.current_model_label.setText(f"Aktualny model: {self.model_reference}")
+            self._update_yolo_profile_summary()
             return
 
         map50 = selected_entry.get("map50")
@@ -2516,6 +2987,7 @@ class InferenceWindow(QMainWindow):
             f"Aktualny model: {model_name} | arch={family} | zrodlo={kind} | "
             f"run={run_name} | mAP50={map50_text} | mAP50-95={map5095_text}"
         )
+        self._update_yolo_profile_summary()
 
     def _populate_model_table(self) -> None:
         self.model_table.setRowCount(len(self.model_catalog))
@@ -2603,6 +3075,20 @@ class InferenceWindow(QMainWindow):
 
         self._apply_controls_to_runtime_state()
         self._rebuild_predict_kwargs()
+        inferred_profile_key = self._infer_yolo_profile_key()
+        self.runtime_cfg["yolo_profile"] = inferred_profile_key
+        self._suppress_setting_autosave = True
+        try:
+            self._set_combo_to_data(self.yolo_profile_combo, inferred_profile_key)
+            self._populate_yolo_model_combo()
+            self._set_model_combo_value(
+                {
+                    "model_name": str(self.model_cfg.get("name", "")),
+                    "selected_model_path": str(self.model_cfg.get("selected_model_path", "")).strip(),
+                }
+            )
+        finally:
+            self._suppress_setting_autosave = False
         self._update_current_model_label()
         self._persist_config(show_message=False)
         self._log(f"Model switched to: {model_path}")
@@ -3581,6 +4067,8 @@ class InferenceWindow(QMainWindow):
             self.navigation_corner_widget.setVisible(visible)
         if hasattr(self, "navigation_overlay_btn") and self.navigation_overlay_btn is not None:
             self.navigation_overlay_btn.setVisible(not visible)
+        if hasattr(self, "exit_app_btn") and self.exit_app_btn is not None:
+            self.exit_app_btn.setVisible(visible)
         self._update_navigation_toggle_button()
         self._position_overlay_controls()
 
@@ -3638,8 +4126,8 @@ class InferenceWindow(QMainWindow):
         self.live_view_layout.setContentsMargins(0, 0, 0, 0)
 
     def _position_overlay_controls(self) -> None:
-        side_margin = 10
-        top_margin = 6
+        side_margin = 0
+        top_margin = 0
 
         if hasattr(self, "exit_app_btn") and self.exit_app_btn is not None:
             parent = self.exit_app_btn.parentWidget()
@@ -4856,6 +5344,8 @@ class InferenceWindow(QMainWindow):
                 )
             if self._enforce_event_retention_limit():
                 self._save_event_entries_index()
+            if hasattr(self, "events_period_combo"):
+                self._refresh_events_filter_controls()
             if hasattr(self, "events_table"):
                 self._refresh_events_table()
             return
@@ -4900,6 +5390,8 @@ class InferenceWindow(QMainWindow):
         self.event_entries = loaded_entries
         if self._enforce_event_retention_limit():
             self._save_event_entries_index()
+        if hasattr(self, "events_period_combo"):
+            self._refresh_events_filter_controls()
         if hasattr(self, "events_table"):
             self._refresh_events_table()
 
@@ -4907,6 +5399,215 @@ class InferenceWindow(QMainWindow):
         self.events_output_dir.mkdir(parents=True, exist_ok=True)
         payload = {"version": 1, "events": self.event_entries}
         self.events_index_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    def _event_datetime(self, entry: dict[str, Any]) -> datetime | None:
+        timestamp = float(entry.get("timestamp", 0.0) or 0.0)
+        if timestamp <= 0.0:
+            return None
+        try:
+            return datetime.fromtimestamp(timestamp)
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _event_period_options(self) -> list[tuple[str, dict[str, str]]]:
+        now_date = datetime.now().date()
+        seen_days: set[str] = set()
+        seen_weeks: set[str] = set()
+        seen_months: set[str] = set()
+        seen_years: set[str] = set()
+        day_items: list[tuple[str, dict[str, str]]] = []
+        week_items: list[tuple[str, dict[str, str]]] = []
+        month_items: list[tuple[str, dict[str, str]]] = []
+        year_items: list[tuple[str, dict[str, str]]] = []
+
+        ordered_entries = sorted(self.event_entries, key=lambda item: float(item.get("timestamp", 0.0) or 0.0), reverse=True)
+        for entry in ordered_entries:
+            dt = self._event_datetime(entry)
+            if dt is None:
+                continue
+            event_date = dt.date()
+            diff_days = (now_date - event_date).days
+            iso_date = event_date.isoformat()
+            if 0 <= diff_days <= 6:
+                if iso_date in seen_days:
+                    continue
+                seen_days.add(iso_date)
+                if diff_days == 0:
+                    label = f"Dzisiaj ({iso_date})"
+                elif diff_days == 1:
+                    label = f"Wczoraj ({iso_date})"
+                else:
+                    label = f"{iso_date} ({diff_days} dni temu)"
+                day_items.append((label, {"kind": "day", "value": iso_date}))
+                continue
+
+            iso_year, iso_week, _iso_weekday = dt.isocalendar()
+            week_key = f"{iso_year}-W{iso_week:02d}"
+            if week_key not in seen_weeks:
+                seen_weeks.add(week_key)
+                week_items.append((f"Tydzien {week_key}", {"kind": "week", "value": week_key}))
+
+            month_key = dt.strftime("%Y-%m")
+            if month_key not in seen_months:
+                seen_months.add(month_key)
+                month_items.append((f"Miesiac {month_key}", {"kind": "month", "value": month_key}))
+
+            year_key = dt.strftime("%Y")
+            if year_key not in seen_years:
+                seen_years.add(year_key)
+                year_items.append((f"Rok {year_key}", {"kind": "year", "value": year_key}))
+
+        items: list[tuple[str, dict[str, str]]] = [("Wszystkie zdarzenia", {"kind": "all", "value": "all"})]
+        items.extend(day_items)
+        items.extend(week_items)
+        items.extend(month_items)
+        items.extend(year_items)
+        return items
+
+    def _refresh_events_filter_controls(self) -> None:
+        if not hasattr(self, "events_period_combo") or self.events_period_combo is None:
+            return
+
+        current_period = self.events_period_combo.currentData()
+        current_camera = self.events_camera_combo.currentData() if hasattr(self, "events_camera_combo") else None
+
+        self.events_period_combo.blockSignals(True)
+        self.events_camera_combo.blockSignals(True)
+        try:
+            self.events_period_combo.clear()
+            for label, payload in self._event_period_options():
+                self.events_period_combo.addItem(label, payload)
+
+            self.events_camera_combo.clear()
+            self.events_camera_combo.addItem("Wszystkie kamery", "all")
+            camera_names = {
+                str(entry.get("source", "")).strip()
+                for entry in self.event_entries
+                if str(entry.get("source", "")).strip()
+            }
+            camera_names.update(
+                str(source.get("name", "")).strip() for source in self.sources if str(source.get("name", "")).strip()
+            )
+            for camera_name in sorted(camera_names):
+                self.events_camera_combo.addItem(camera_name, camera_name)
+
+            period_index = self.events_period_combo.findData(current_period)
+            self.events_period_combo.setCurrentIndex(0 if period_index < 0 else period_index)
+            camera_index = self.events_camera_combo.findData(current_camera)
+            self.events_camera_combo.setCurrentIndex(0 if camera_index < 0 else camera_index)
+        finally:
+            self.events_period_combo.blockSignals(False)
+            self.events_camera_combo.blockSignals(False)
+
+    def _event_matches_period(self, entry_dt: datetime, period_payload: dict[str, str] | None) -> bool:
+        if not isinstance(period_payload, dict):
+            return True
+        kind = str(period_payload.get("kind", "all"))
+        value = str(period_payload.get("value", "all"))
+        if kind == "all":
+            return True
+        if kind == "day":
+            return entry_dt.strftime("%Y-%m-%d") == value
+        if kind == "week":
+            iso_year, iso_week, _weekday = entry_dt.isocalendar()
+            return f"{iso_year}-W{iso_week:02d}" == value
+        if kind == "month":
+            return entry_dt.strftime("%Y-%m") == value
+        if kind == "year":
+            return entry_dt.strftime("%Y") == value
+        return True
+
+    def _event_matches_hour_filter(self, entry_dt: datetime) -> bool:
+        if not hasattr(self, "events_hour_filter_checkbox") or not self.events_hour_filter_checkbox.isChecked():
+            return True
+        from_time = self.events_hour_from_edit.time().toPyTime()
+        to_time = self.events_hour_to_edit.time().toPyTime()
+        entry_time = entry_dt.time()
+        if from_time <= to_time:
+            return from_time <= entry_time <= to_time
+        return entry_time >= from_time or entry_time <= to_time
+
+    def _event_group_header_label(self, entry_dt: datetime) -> str:
+        weekday_names = {
+            0: "Poniedzialek",
+            1: "Wtorek",
+            2: "Sroda",
+            3: "Czwartek",
+            4: "Piatek",
+            5: "Sobota",
+            6: "Niedziela",
+        }
+        month_names = {
+            1: "Styczen",
+            2: "Luty",
+            3: "Marzec",
+            4: "Kwiecien",
+            5: "Maj",
+            6: "Czerwiec",
+            7: "Lipiec",
+            8: "Sierpien",
+            9: "Wrzesien",
+            10: "Pazdziernik",
+            11: "Listopad",
+            12: "Grudzien",
+        }
+
+        now_date = datetime.now().date()
+        event_date = entry_dt.date()
+        diff_days = (now_date - event_date).days
+        if diff_days == 0:
+            return f"Dzisiaj - {event_date.strftime('%Y-%m-%d')}"
+        if diff_days == 1:
+            return f"Wczoraj - {event_date.strftime('%Y-%m-%d')}"
+        if 0 <= diff_days <= 6:
+            return f"{weekday_names.get(entry_dt.weekday(), event_date.strftime('%A'))} - {event_date.strftime('%Y-%m-%d')}"
+        return month_names.get(entry_dt.month, entry_dt.strftime("%Y-%m"))
+
+    def _event_group_key(self, entry_dt: datetime) -> str:
+        now_date = datetime.now().date()
+        event_date = entry_dt.date()
+        diff_days = (now_date - event_date).days
+        if 0 <= diff_days <= 6:
+            return f"day:{event_date.isoformat()}"
+        return f"month:{entry_dt.strftime('%Y-%m')}"
+
+    def _filtered_event_entries(self) -> list[tuple[int, dict[str, Any]]]:
+        selected_camera = str(self.events_camera_combo.currentData() or "all") if hasattr(self, "events_camera_combo") else "all"
+        selected_mode = str(self.events_mode_combo.currentData() or "all") if hasattr(self, "events_mode_combo") else "all"
+        period_payload = self.events_period_combo.currentData() if hasattr(self, "events_period_combo") else {"kind": "all", "value": "all"}
+        exact_day_enabled = hasattr(self, "events_exact_day_checkbox") and self.events_exact_day_checkbox.isChecked()
+        exact_day_value = self.events_exact_day_edit.date().toString("yyyy-MM-dd") if exact_day_enabled else ""
+
+        filtered: list[tuple[int, dict[str, Any]]] = []
+        ordered = list(enumerate(self.event_entries))
+        ordered.reverse()
+        for entry_index, entry in ordered:
+            source_text = str(entry.get("source", "")).strip()
+            if selected_camera not in {"", "all"} and source_text != selected_camera:
+                continue
+
+            mode_text = str(entry.get("mode", "day")).strip().lower()
+            if selected_mode not in {"", "all"} and mode_text != selected_mode:
+                continue
+
+            dt = self._event_datetime(entry)
+            if dt is None:
+                continue
+
+            if exact_day_enabled and dt.strftime("%Y-%m-%d") != exact_day_value:
+                continue
+            if not self._event_matches_period(dt, period_payload):
+                continue
+            if not self._event_matches_hour_filter(dt):
+                continue
+            filtered.append((entry_index, entry))
+        return filtered
+
+    def _schedule_events_table_refresh(self, *_args: Any) -> None:
+        if not hasattr(self, "_events_filter_timer") or self._events_filter_timer is None:
+            self._refresh_events_table()
+            return
+        self._events_filter_timer.start(120)
 
     def _enforce_event_retention_limit(self) -> bool:
         max_saved = int(self.events_max_saved)
@@ -4930,40 +5631,96 @@ class InferenceWindow(QMainWindow):
                 pass
         return True
 
-    def _refresh_events_table(self, select_newest: bool = False) -> None:
+    def _refresh_events_table(self, *_args: Any, select_newest: bool = False) -> None:
         if not hasattr(self, "events_table"):
             return
+        if hasattr(self, "_events_filter_timer") and self._events_filter_timer.isActive():
+            self._events_filter_timer.stop()
 
+        self.events_table.blockSignals(True)
         self._event_table_updating = True
         try:
-            ordered = list(enumerate(self.event_entries))
-            ordered.reverse()
-            self.events_table.setRowCount(len(ordered))
-            for row, (entry_index, entry) in enumerate(ordered):
-                timestamp = float(entry.get("timestamp", 0.0) or 0.0)
-                if timestamp > 0:
-                    time_text = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(timestamp))
+            ordered = self._filtered_event_entries()
+            self.events_table.clearSpans()
+            self.events_table.clearSelection()
+            self.events_table.setCurrentCell(-1, -1)
+            rows_to_render: list[tuple[str, Any]] = []
+            previous_group_key = ""
+            for entry_index, entry in ordered:
+                dt = self._event_datetime(entry)
+                if dt is None:
+                    continue
+                group_key = self._event_group_key(dt)
+                if group_key != previous_group_key:
+                    rows_to_render.append(("group", self._event_group_header_label(dt)))
+                    previous_group_key = group_key
+                rows_to_render.append(("event", (entry_index, entry)))
+
+            self.events_table.setRowCount(len(rows_to_render))
+            for row, (row_kind, payload) in enumerate(rows_to_render):
+                if row_kind == "group":
+                    header_item = QTableWidgetItem(str(payload))
+                    header_item.setFlags(Qt.ItemFlag.ItemIsEnabled)
+                    header_item.setForeground(QColor("#d9e7ff"))
+                    header_item.setBackground(QColor("#243041"))
+                    header_item.setTextAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)
+                    header_font = header_item.font()
+                    header_font.setPointSize(max(12, header_font.pointSize() + 2))
+                    header_font.setBold(True)
+                    header_item.setFont(header_font)
+                    self.events_table.setSpan(row, 0, 1, self.events_table.columnCount())
+                    self.events_table.setItem(row, 0, header_item)
+                    for col in range(1, self.events_table.columnCount()):
+                        filler_item = QTableWidgetItem("")
+                        filler_item.setFlags(Qt.ItemFlag.NoItemFlags)
+                        filler_item.setBackground(QColor("#243041"))
+                        self.events_table.setItem(row, col, filler_item)
+                    continue
+
+                entry_index, entry = payload
+                dt = self._event_datetime(entry)
+                if dt is None:
+                    date_text = "-"
+                    hour_text = "-"
                 else:
-                    time_text = "-"
+                    date_text = dt.strftime("%Y-%m-%d")
+                    hour_text = dt.strftime("%H:%M:%S")
                 source_text = str(entry.get("source", "source"))
-                mode_text = str(entry.get("mode", "day"))
+                mode_raw = str(entry.get("mode", "day")).strip().lower()
+                mode_text = "Dzien" if mode_raw == "day" else "Noc" if mode_raw == "night" else mode_raw
                 persons_text = str(int(entry.get("persons", 0) or 0))
                 visible_text = f"{float(entry.get('visible_sec', 0.0) or 0.0):.1f}"
                 file_text = str(entry.get("file", ""))
 
-                values = [time_text, source_text, mode_text, persons_text, visible_text, file_text]
+                values = [date_text, hour_text, source_text, mode_text, persons_text, visible_text, file_text]
                 for col, text in enumerate(values):
-                    item = QTableWidgetItem(text)
+                    display_text = f"   {text}" if col < 6 else text
+                    item = QTableWidgetItem(display_text)
                     item.setData(Qt.ItemDataRole.UserRole, int(entry_index))
+                    if row % 2 == 0:
+                        item.setBackground(QColor("#141b25"))
+                    else:
+                        item.setBackground(QColor("#101722"))
+                    item.setForeground(QColor("#edf2fb"))
                     self.events_table.setItem(row, col, item)
 
             if hasattr(self, "events_status_label"):
-                self.events_status_label.setText(f"Saved events: {len(self.event_entries)}")
+                self.events_status_label.setText(
+                    f"Zdarzenia: {len(ordered)} / {len(self.event_entries)}"
+                )
         finally:
             self._event_table_updating = False
+            self.events_table.blockSignals(False)
 
         if select_newest and self.events_table.rowCount() > 0:
-            self.events_table.setCurrentCell(0, 0)
+            for row in range(self.events_table.rowCount()):
+                item = self.events_table.item(row, 0)
+                if item is not None and item.data(Qt.ItemDataRole.UserRole) is not None:
+                    self.events_table.setCurrentCell(row, 0)
+                    break
+        elif self.events_table.rowCount() > 0:
+            self.events_preview.set_frame(None)
+            self.events_preview.setText("Wybierz zdarzenie z listy, aby zaladowac podglad.")
         elif self.events_table.rowCount() <= 0:
             self.events_preview.set_frame(None)
             self.events_preview.setText("Brak zapisanych zdarzen.")
@@ -5002,6 +5759,16 @@ class InferenceWindow(QMainWindow):
             self.events_preview.set_frame(None)
             self.events_preview.setText("Plik zdarzenia nie istnieje.")
             return
+
+        dt = self._event_datetime(entry)
+        if dt is not None:
+            mode_raw = str(entry.get("mode", "day")).strip().lower()
+            mode_text = "dzien" if mode_raw == "day" else "noc" if mode_raw == "night" else mode_raw
+            self.events_preview.setText(
+                f"Kamera: {entry.get('source', 'source')}\n"
+                f"Tryb: {mode_text}\n"
+                f"Czas: {dt.strftime('%Y-%m-%d %H:%M:%S')}"
+            )
 
         frame: np.ndarray | None = None
         suffix = file_path.suffix.lower()
@@ -5090,6 +5857,8 @@ class InferenceWindow(QMainWindow):
                 self.events_index_path.unlink()
         except Exception:  # noqa: BLE001
             pass
+        if hasattr(self, "events_period_combo"):
+            self._refresh_events_filter_controls()
         self._refresh_events_table()
         self._log("All saved events were removed.")
 
@@ -5465,10 +6234,20 @@ class InferenceWindow(QMainWindow):
         self.security_cfg["day_person_threshold"] = int(self.day_threshold_spin.value())
         self.security_cfg["night_person_threshold"] = int(self.night_threshold_spin.value())
 
+        selected_profile_key = str(self.yolo_profile_combo.currentData() or self._infer_yolo_profile_key()).strip().lower()
+        if selected_profile_key in YOLO_PROFILE_PRESETS or selected_profile_key == YOLO_PROFILE_CUSTOM:
+            self.runtime_cfg["yolo_profile"] = selected_profile_key
+
         self.inference_cfg["conf"] = float(self.conf_spin.value())
         self.inference_cfg["iou"] = float(self.iou_spin.value())
-        self.inference_cfg["imgsz"] = int(self.imgsz_spin.value())
+        self.inference_cfg["imgsz"] = int(self._current_imgsz_value())
         self.inference_cfg["max_det"] = int(self.max_det_spin.value())
+        current_model_selection = self._current_yolo_model_selection()
+        selected_model_name = current_model_selection["model_name"]
+        selected_model_path = current_model_selection["selected_model_path"]
+        if selected_model_name:
+            self.model_cfg["name"] = selected_model_name
+        self.model_cfg["selected_model_path"] = selected_model_path
 
         raw_device = self.device_edit.text().strip()
         if raw_device.lower() in {"", "auto", "none"}:
@@ -5484,6 +6263,7 @@ class InferenceWindow(QMainWindow):
         self.runtime_cfg["loop_videos"] = bool(self.loop_videos)
         self.runtime_cfg["frame_interval_ms"] = int(self.frame_interval_ms)
         self.runtime_cfg["view_target_fps"] = float(self.view_target_fps)
+        self.model_target_fps = float(self.model_target_fps_spin.value())
         self.runtime_cfg["model_target_fps"] = float(self.model_target_fps)
         self.runtime_cfg["max_infer_per_tick"] = int(self.max_infer_per_tick)
         self.runtime_cfg["live_tile_spacing"] = int(self.live_tile_spacing)
