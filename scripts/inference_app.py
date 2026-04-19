@@ -8,9 +8,12 @@ import importlib.util
 import json
 import math
 import os
+import re
 import sys
 import threading
 import time
+import urllib.error
+import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
@@ -20,6 +23,7 @@ os.environ.setdefault("OPENCV_LOG_LEVEL", "SILENT")
 
 import cv2
 import numpy as np
+import torch
 from ultralytics import YOLO
 
 from PyQt6.QtCore import QDate, QEvent, QPoint, QPointF, QRectF, QSize, Qt, QTime, QTimer, pyqtSignal
@@ -39,6 +43,7 @@ from PyQt6.QtWidgets import (
     QGroupBox,
     QHBoxLayout,
     QHeaderView,
+    QInputDialog,
     QLabel,
     QLineEdit,
     QMainWindow,
@@ -241,15 +246,9 @@ def _extract_run_name_from_weight_filename(filename: str) -> str | None:
 
 def _infer_model_family(name: str) -> str:
     text = str(name or "").lower()
-    for family in ("yolo26n", "yolo26s", "yolo26m", "yolo26l", "yolo26x"):
-        if family in text:
-            return family
-    for family in ("yolov8n", "yolov8s", "yolov8m", "yolov8l", "yolov8x"):
-        if family in text:
-            return family
-    for family in ("yolov5n", "yolov5s", "yolov5m", "yolov5l", "yolov5x"):
-        if family in text:
-            return family
+    match = re.search(r"(yolo(?:v?\d+)[nslmx]?)", text)
+    if match is not None:
+        return str(match.group(1)).lower()
     return "-"
 
 
@@ -1062,8 +1061,11 @@ class InferenceWindow(QMainWindow):
         self.model_reference = ""
         self.current_model_path: Path | None = None
         self.predict_kwargs: dict[str, Any] = {}
+        self.compile_requested = False
         self.compile_enabled = False
         self.compile_fallback_applied = False
+        self.manual_compile_active = False
+        self._last_saved_config_signature = ""
 
         self.runtimes: dict[str, SourceRuntime] = {}
         self.trackers: dict[str, Any] = {}
@@ -1076,7 +1078,7 @@ class InferenceWindow(QMainWindow):
         self.live_running = False
         self.frame_interval_ms = int(self.runtime_cfg.get("frame_interval_ms", 16))
         self.view_target_fps = float(_clamp(float(self.runtime_cfg.get("view_target_fps", 60.0)), 1.0, 60.0))
-        self.model_target_fps = max(0.1, float(self.runtime_cfg.get("model_target_fps", 6.0)))
+        self.model_target_fps = max(1, int(round(float(self.runtime_cfg.get("model_target_fps", 6.0)))))
         self.max_infer_per_tick = max(1, int(self.runtime_cfg.get("max_infer_per_tick", 2)))
         self.loop_videos = bool(self.runtime_cfg.get("loop_videos", True))
         self.live_tile_spacing = max(0, int(self.runtime_cfg.get("live_tile_spacing", 4)))
@@ -1107,6 +1109,16 @@ class InferenceWindow(QMainWindow):
             1,
             int(self.runtime_cfg.get("event_writer_max_pending_frames", 8)),
         )
+        self._load_shed_level = 0.0
+        self._load_shed_last_pressure_ts = 0.0
+        self._load_shed_last_log_ts = 0.0
+        self._load_shed_decay_block_until_ts = 0.0
+        self._load_shed_initial_level = float(_clamp(float(self.runtime_cfg.get("load_shed_initial_level", 0.70)), 0.10, 1.0))
+        self._load_shed_min_view_fps = max(5.0, float(self.runtime_cfg.get("load_shed_min_view_fps", 10.0)))
+        self._load_shed_min_model_fps = max(1.0, float(self.runtime_cfg.get("load_shed_min_model_fps", 4.0)))
+        self._load_shed_hold_seconds = max(1.0, float(self.runtime_cfg.get("load_shed_hold_seconds", 6.0)))
+        self._load_shed_sticky_seconds = max(1.0, float(self.runtime_cfg.get("load_shed_sticky_seconds", 18.0)))
+        self._load_shed_decay_per_sec = max(0.05, float(self.runtime_cfg.get("load_shed_decay_per_sec", 0.20)))
         self._live_timer_interval_ms = int(max(1, self.frame_interval_ms))
         self._live_timer_last_adjust_ts = 0.0
         self.events_enabled = bool(self.events_cfg.get("enabled", True))
@@ -1114,6 +1126,7 @@ class InferenceWindow(QMainWindow):
         self.events_cooldown_seconds = max(0.0, float(self.events_cfg.get("cooldown_seconds", 10.0)))
         self.events_linger_seconds = max(0.0, float(self.events_cfg.get("linger_seconds", 1.5)))
         self.events_min_person_count = max(1, int(self.events_cfg.get("min_person_count", 1)))
+        self.events_clip_fps = max(1.0, float(self.events_cfg.get("clip_fps", 30.0)))
         self.events_save_annotated = bool(self.events_cfg.get("save_annotated_frame", True))
         self.events_once_per_streak = bool(self.events_cfg.get("once_per_streak", True))
         self.events_max_saved = max(0, int(self.events_cfg.get("max_saved_events", 300)))
@@ -1129,12 +1142,22 @@ class InferenceWindow(QMainWindow):
         self._log_flush_interval_ms = max(20, int(self.runtime_cfg.get("log_flush_interval_ms", 120)))
         self._log_flush_batch_size = max(1, int(self.runtime_cfg.get("log_flush_batch_size", 200)))
         self._settings_autosave_delay_ms = max(100, int(self.runtime_cfg.get("settings_autosave_delay_ms", 400)))
+        self.settings_dirty = False
+        self._settings_change_tracking_ready = False
+        self._last_main_tab_index = 0
+        self._suppress_main_tab_change_handler = False
+        self._settings_tab_index = -1
         if self._tracker_disabled_reason:
             self._log(self._tracker_disabled_reason)
         elif self.tracker_enabled:
             self._log("ByteTrack enabled.")
 
         self.model_catalog: list[dict[str, Any]] = []
+        self.model_table_row_map: list[int | None] = []
+        self._online_model_suggestions_cache: set[str] | None = None
+        self._online_model_suggestions_error_logged = False
+        self._source_table_min_visible_rows = 8
+        self._source_table_max_visible_rows = 15
 
         self.recording_capture: cv2.VideoCapture | None = None
         self.recording_playing = False
@@ -1172,6 +1195,8 @@ class InferenceWindow(QMainWindow):
         self._rebuild_source_table()
         self._rebuild_live_layout()
         self._refresh_model_catalog()
+        self._settings_change_tracking_ready = True
+        self._clear_settings_dirty()
 
         self._log("Application started.")
         if self.auto_start_live:
@@ -1291,23 +1316,178 @@ class InferenceWindow(QMainWindow):
         if half is not None:
             self.predict_kwargs["half"] = bool(half)
 
-        if self.compile_enabled:
+        if self.compile_enabled and not self.manual_compile_active:
             self.predict_kwargs["compile"] = True
         else:
             self.predict_kwargs.pop("compile", None)
 
+    def _is_compile_runtime_error(self, exc: Exception) -> bool:
+        message = str(exc)
+        normalized = message.lower()
+        return (
+            "autobackend does not support len()" in normalized
+            or "does not support len()" in normalized
+            or "torch._inductor" in normalized
+            or "triton" in normalized
+        )
+
+    def _compile_status_text(self) -> str:
+        if self.manual_compile_active:
+            return "enabled (manual backend compile)"
+        if self.compile_enabled:
+            return "enabled (ultralytics compile arg)"
+        if self.compile_requested:
+            return "disabled (fallback to eager)"
+        return "disabled"
+
+    def _snapshot_settings_state(self) -> dict[str, dict[str, Any]]:
+        return {
+            "model": dict(self.model_cfg),
+            "inference": dict(self.inference_cfg),
+            "tracker": dict(self.tracker_cfg),
+            "security": dict(self.security_cfg),
+            "events": dict(self.events_cfg),
+            "runtime": dict(self.runtime_cfg),
+        }
+
+    def _format_setting_value(self, value: Any) -> str:
+        if isinstance(value, float):
+            return f"{value:.6g}"
+        if isinstance(value, (list, dict, tuple, set)):
+            try:
+                return json.dumps(value, ensure_ascii=True, sort_keys=True, default=str)
+            except Exception:  # noqa: BLE001
+                return str(value)
+        return str(value)
+
+    def _collect_setting_changes(
+        self,
+        before: dict[str, dict[str, Any]],
+        after: dict[str, dict[str, Any]],
+    ) -> list[str]:
+        changes: list[str] = []
+        sections = sorted(set(before.keys()) | set(after.keys()))
+        for section in sections:
+            before_map = dict(before.get(section, {}))
+            after_map = dict(after.get(section, {}))
+            keys = sorted(set(before_map.keys()) | set(after_map.keys()))
+            for key in keys:
+                old_value = before_map.get(key)
+                new_value = after_map.get(key)
+                if old_value == new_value:
+                    continue
+                changes.append(
+                    f"{section}.{key}: {self._format_setting_value(old_value)} -> {self._format_setting_value(new_value)}"
+                )
+        return changes
+
+    def _log_active_model_runtime(self, *, reason: str) -> None:
+        model_path_text = self.model_reference or "-"
+        classes = self.predict_kwargs.get("classes")
+        classes_text = "all" if not classes else str(classes)
+        self._log(
+            "Model runtime "
+            f"[{reason}] "
+            f"path={model_path_text} | "
+            f"conf={self.predict_kwargs.get('conf')} iou={self.predict_kwargs.get('iou')} "
+            f"imgsz={self.predict_kwargs.get('imgsz')} max_det={self.predict_kwargs.get('max_det')} "
+            f"device={self.predict_kwargs.get('device', 'auto')} half={self.predict_kwargs.get('half', False)} "
+            f"classes={classes_text} | "
+            f"compile_requested={self.compile_requested} compile_status={self._compile_status_text()}"
+        )
+
+    def _preflight_compile_predict(self) -> None:
+        if self.model is None or not self.compile_enabled:
+            return
+
+        probe_imgsz = int(self.predict_kwargs.get("imgsz", self.inference_cfg.get("imgsz", 960)))
+        probe_imgsz = max(64, min(2048, probe_imgsz))
+        probe_frame = np.zeros((probe_imgsz, probe_imgsz, 3), dtype=np.uint8)
+
+        with self._model_lock:
+            try:
+                _ = self.model.predict([probe_frame], **self.predict_kwargs)
+            except Exception as exc:  # noqa: BLE001
+                if not self._is_compile_runtime_error(exc):
+                    raise
+
+                self.compile_enabled = False
+                self.inference_cfg["compile"] = False
+                self.predict_kwargs.pop("compile", None)
+                try:
+                    self.model.predictor = None
+                except Exception:  # noqa: BLE001
+                    pass
+
+                self._log(
+                    "compile preflight failed, fallback to compile=False "
+                    f"({exc.__class__.__name__}: {exc})"
+                )
+
+    def _try_manual_backend_compile(self) -> bool:
+        if self.model is None or not self.compile_enabled:
+            return False
+        if not hasattr(torch, "compile"):
+            return False
+
+        compile_value = self.inference_cfg.get("compile", True)
+        if isinstance(compile_value, bool):
+            compile_mode = "default"
+        else:
+            compile_mode = str(compile_value).strip() or "default"
+
+        probe_imgsz = int(self.predict_kwargs.get("imgsz", self.inference_cfg.get("imgsz", 960)))
+        probe_imgsz = max(64, min(2048, probe_imgsz))
+        probe_frame = np.zeros((probe_imgsz, probe_imgsz, 3), dtype=np.uint8)
+        probe_kwargs = dict(self.predict_kwargs)
+        probe_kwargs.pop("compile", None)
+
+        with self._model_lock:
+            try:
+                _ = self.model.predict([probe_frame], **probe_kwargs)
+                predictor = getattr(self.model, "predictor", None)
+                auto_backend = getattr(predictor, "model", None)
+                backend = getattr(auto_backend, "backend", None)
+                backend_model = getattr(backend, "model", None)
+                if backend_model is None or not isinstance(backend_model, torch.nn.Module):
+                    return False
+
+                compiled_model = torch.compile(backend_model, mode=compile_mode, backend="inductor")
+                backend.model = compiled_model
+
+                # Run one tiny eager call through predictor API so the compiled graph is built early.
+                _ = self.model.predict([probe_frame], **probe_kwargs)
+
+                self.manual_compile_active = True
+                self.compile_enabled = False
+                self.predict_kwargs.pop("compile", None)
+                self._log(f"manual backend compile enabled (mode={compile_mode})")
+                return True
+            except Exception as exc:  # noqa: BLE001
+                self._log(
+                    "manual backend compile failed, fallback to eager "
+                    f"({exc.__class__.__name__}: {exc})"
+                )
+                self.manual_compile_active = False
+                return False
+
     def _load_model(self) -> None:
         ensure_windows_compile_env(self.inference_cfg, compile_value=self.inference_cfg.get("compile", False))
-        self.compile_enabled = _is_compile_enabled(self.inference_cfg.get("compile", False))
+        self.compile_requested = _is_compile_enabled(self.inference_cfg.get("compile", False))
+        self.compile_enabled = self.compile_requested
 
         model, reference, reference_path = self._resolve_model_reference()
         self.model = model
         self.model_reference = reference
         self.current_model_path = reference_path
         self.compile_fallback_applied = False
+        self.manual_compile_active = False
 
         self._rebuild_predict_kwargs()
+        if self.compile_enabled and not self._try_manual_backend_compile():
+            self._preflight_compile_predict()
         self._log(f"Model loaded: {reference}")
+        self._log_active_model_runtime(reason="load")
 
     # ---------- UI ----------
     def _build_ui(self) -> None:
@@ -1325,10 +1505,17 @@ class InferenceWindow(QMainWindow):
         self.main_tabs.tabBar().installEventFilter(self)
         self.main_tabs.setTabPosition(QTabWidget.TabPosition.North)
         self.main_tabs.addTab(self._build_preview_tab(), "Podglad kamer")
-        self.main_tabs.addTab(self._build_camera_config_tab(), "Konfiguracja kamer")
-        self.main_tabs.addTab(self._build_events_tab(), "Wykryty ruch")
-        self.main_tabs.addTab(self._build_settings_tab(), "Ustawienia")
-        self.main_tabs.addTab(self._build_logs_tab(), "Logi")
+        camera_config_page = self._build_camera_config_tab()
+        events_page = self._build_events_tab()
+        self.main_tabs.addTab(self._wrap_main_tab_page(camera_config_page), "Konfiguracja kamer")
+        self.main_tabs.addTab(self._wrap_main_tab_page(events_page), "Wykryty ruch")
+        self.settings_tab_page = self._build_settings_tab()
+        self._settings_tab_index = self.main_tabs.addTab(
+            self._wrap_main_tab_page(self.settings_tab_page), "Ustawienia"
+        )
+        logs_page = self._build_logs_tab()
+        self.main_tabs.addTab(self._wrap_main_tab_page(logs_page), "Logi")
+        self.main_tabs.currentChanged.connect(self._on_main_tab_changed)
         layout.addWidget(self.main_tabs)
 
         self.navigation_corner_widget = QWidget(self.main_tabs)
@@ -1390,10 +1577,20 @@ class InferenceWindow(QMainWindow):
         self._set_controls_from_config()
         self._bind_setting_autosave()
         self.main_tabs.setCurrentIndex(0)
+        self._last_main_tab_index = 0
         self.preview_tabs.setCurrentIndex(0)
         self._apply_theme()
         self._set_navigation_tabs_visibility(self.navigation_tabs_visible, persist=False)
         self._position_overlay_controls()
+
+    def _wrap_main_tab_page(self, page: QWidget) -> QScrollArea:
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        scroll.setWidget(page)
+        return scroll
 
     def _apply_theme(self) -> None:
         app = QApplication.instance()
@@ -1520,6 +1717,29 @@ class InferenceWindow(QMainWindow):
         content = QWidget()
         layout = QVBoxLayout(content)
         layout.setSpacing(10)
+
+        header_actions = QHBoxLayout()
+        header_actions.setContentsMargins(0, 0, 0, 0)
+        header_actions.setSpacing(8)
+        self.settings_unsaved_label = QLabel("Niezapisane zmiany")
+        self.settings_unsaved_label.setStyleSheet("color: #ffb74d; font-weight: 700;")
+        self.settings_unsaved_label.setVisible(False)
+        self.settings_reset_btn = QPushButton("Reset do domyslnych")
+        self.settings_reset_btn.clicked.connect(self._reset_settings_to_defaults)
+        self.settings_load_preset_btn = QPushButton("Wczytaj preset")
+        self.settings_load_preset_btn.clicked.connect(self._load_settings_preset)
+        self.settings_save_preset_btn = QPushButton("Zapisz preset")
+        self.settings_save_preset_btn.clicked.connect(self._save_settings_preset)
+        self.settings_apply_btn = QPushButton("Potwierdz i zapisz")
+        self.settings_apply_btn.clicked.connect(self._confirm_and_save_settings)
+        header_actions.addStretch(1)
+        header_actions.addWidget(self.settings_unsaved_label)
+        header_actions.addWidget(self.settings_reset_btn)
+        header_actions.addWidget(self.settings_load_preset_btn)
+        header_actions.addWidget(self.settings_save_preset_btn)
+        header_actions.addWidget(self.settings_apply_btn)
+        layout.addLayout(header_actions)
+
         settings_box_style = (
             "QGroupBox {"
             "font-size: 16px;"
@@ -1614,10 +1834,9 @@ class InferenceWindow(QMainWindow):
         self.yolo_model_combo = QComboBox()
         self.yolo_model_combo.setMaxVisibleItems(20)
 
-        self.model_target_fps_spin = QDoubleSpinBox()
-        self.model_target_fps_spin.setRange(1.0, 60.0)
-        self.model_target_fps_spin.setSingleStep(1.0)
-        self.model_target_fps_spin.setDecimals(1)
+        self.model_target_fps_spin = QSpinBox()
+        self.model_target_fps_spin.setRange(1, 60)
+        self.model_target_fps_spin.setSingleStep(1)
 
         self.conf_spin = QDoubleSpinBox()
         self.conf_spin.setRange(0.01, 0.99)
@@ -1711,6 +1930,10 @@ class InferenceWindow(QMainWindow):
         self.events_min_person_spin = QSpinBox()
         self.events_min_person_spin.setRange(1, 20)
 
+        self.events_clip_fps_spin = QSpinBox()
+        self.events_clip_fps_spin.setRange(1, 120)
+        self.events_clip_fps_spin.setSingleStep(1)
+
         self.events_max_saved_spin = QSpinBox()
         self.events_max_saved_spin.setRange(0, 20000)
         self.events_max_saved_spin.setSpecialValueText("0 (bez limitu)")
@@ -1742,12 +1965,14 @@ class InferenceWindow(QMainWindow):
         events_grid.addWidget(self.events_linger_spin, 3, 1)
         events_grid.addWidget(QLabel("Min. liczba osob:"), 4, 0)
         events_grid.addWidget(self.events_min_person_spin, 4, 1)
-        events_grid.addWidget(QLabel("Maks. liczba zapisanych zdarzen:"), 5, 0)
-        events_grid.addWidget(self.events_max_saved_spin, 5, 1)
-        events_grid.addWidget(save_annotated_row, 6, 0, 1, 2)
-        events_grid.addWidget(once_row, 7, 0, 1, 2)
-        events_grid.addWidget(QLabel("Folder zapisu zdarzen:"), 8, 0)
-        events_grid.addWidget(output_row_widget, 8, 1)
+        events_grid.addWidget(QLabel("FPS zapisu klipu:"), 5, 0)
+        events_grid.addWidget(self.events_clip_fps_spin, 5, 1)
+        events_grid.addWidget(QLabel("Maks. liczba zapisanych zdarzen:"), 6, 0)
+        events_grid.addWidget(self.events_max_saved_spin, 6, 1)
+        events_grid.addWidget(save_annotated_row, 7, 0, 1, 2)
+        events_grid.addWidget(once_row, 8, 0, 1, 2)
+        events_grid.addWidget(QLabel("Folder zapisu zdarzen:"), 9, 0)
+        events_grid.addWidget(output_row_widget, 9, 1)
 
         top_settings_row.addWidget(events_box, stretch=1)
         layout.addLayout(top_settings_row)
@@ -1768,15 +1993,13 @@ class InferenceWindow(QMainWindow):
         self.model_help_label.setStyleSheet("color: #9fb0c9;")
         model_layout.addWidget(self.model_help_label)
 
-        self.model_table = QTableWidget(0, 9)
+        self.model_table = QTableWidget(0, 7)
         self.model_table.setHorizontalHeaderLabels(
             [
                 "Dostepny",
                 "Model",
                 "Zrodlo",
                 "Arch",
-                "mAP50",
-                "mAP50-95",
                 "Size(MB)",
                 "Run",
                 "Path",
@@ -1786,6 +2009,8 @@ class InferenceWindow(QMainWindow):
         self.model_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.model_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.model_table.verticalHeader().setVisible(False)
+        self.model_table.verticalHeader().setDefaultSectionSize(30)
+        self.model_table.setMinimumHeight(420)
         self.model_table.itemDoubleClicked.connect(self._apply_selected_model)
 
         header = self.model_table.horizontalHeader()
@@ -1795,9 +2020,7 @@ class InferenceWindow(QMainWindow):
         header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(6, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(7, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(8, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(6, QHeaderView.ResizeMode.Stretch)
 
         model_layout.addWidget(self.model_table)
 
@@ -1808,16 +2031,16 @@ class InferenceWindow(QMainWindow):
         download_model_btn.clicked.connect(self._download_selected_model)
         apply_model_btn = QPushButton("Zaladuj wybrany model")
         apply_model_btn.clicked.connect(self._apply_selected_model)
+        for btn in (refresh_models_btn, download_model_btn, apply_model_btn):
+            btn.setFixedWidth(280)
+            btn.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
         model_buttons.addWidget(refresh_models_btn)
         model_buttons.addWidget(download_model_btn)
         model_buttons.addWidget(apply_model_btn)
+        model_buttons.addStretch(1)
         model_layout.addLayout(model_buttons)
 
         layout.addWidget(model_box)
-
-        save_settings_btn = QPushButton("Zapisz ustawienia")
-        save_settings_btn.clicked.connect(lambda: self._persist_config(show_message=True))
-        layout.addWidget(save_settings_btn)
 
         layout.addStretch(1)
         scroll.setWidget(content)
@@ -1856,6 +2079,8 @@ class InferenceWindow(QMainWindow):
         self.source_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.source_table.verticalHeader().setVisible(False)
         self.source_table.verticalHeader().setDefaultSectionSize(30)
+        self.source_table.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.source_table.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         self.source_table.setStyleSheet(
             "QTableWidget { font-size: 12px; }"
             "QHeaderView::section {"
@@ -1872,6 +2097,7 @@ class InferenceWindow(QMainWindow):
         header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents)
+        self._update_source_table_height()
 
         self.source_table.itemChanged.connect(self._on_source_item_changed)
         table_layout.addWidget(self.source_table)
@@ -1954,7 +2180,11 @@ class InferenceWindow(QMainWindow):
 
         add_btn = QPushButton("Add camera")
         add_btn.clicked.connect(self._add_camera_source)
-        layout.addWidget(add_btn)
+        add_btn.setFixedWidth(240)
+        add_row = QHBoxLayout()
+        add_row.addWidget(add_btn)
+        add_row.addStretch(1)
+        layout.addLayout(add_row)
 
         layout.addStretch(1)
         if self.auto_scan_cameras_on_startup:
@@ -1992,7 +2222,11 @@ class InferenceWindow(QMainWindow):
 
         add_btn = QPushButton("Add video source")
         add_btn.clicked.connect(self._add_video_source)
-        layout.addWidget(add_btn)
+        add_btn.setFixedWidth(240)
+        add_row = QHBoxLayout()
+        add_row.addWidget(add_btn)
+        add_row.addStretch(1)
+        layout.addLayout(add_row)
 
         layout.addStretch(1)
         return page
@@ -2011,7 +2245,11 @@ class InferenceWindow(QMainWindow):
 
         add_btn = QPushButton("Add stream source")
         add_btn.clicked.connect(self._add_stream_source)
-        layout.addWidget(add_btn)
+        add_btn.setFixedWidth(240)
+        add_row = QHBoxLayout()
+        add_row.addWidget(add_btn)
+        add_row.addStretch(1)
+        layout.addLayout(add_row)
 
         layout.addStretch(1)
         return page
@@ -2043,12 +2281,6 @@ class InferenceWindow(QMainWindow):
         self.live_view_layout.setSpacing(0)
         self.live_view_layout.setContentsMargins(0, 0, 0, 0)
 
-        self.start_live_btn = QPushButton("Start")
-        self.stop_live_btn = QPushButton("Stop")
-
-        self.start_live_btn.clicked.connect(self.start_live)
-        self.stop_live_btn.clicked.connect(self.stop_live)
-
         self.live_placeholder = QLabel("No enabled sources. Add or enable sources in Kamera config.")
         self.live_placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.live_placeholder.setStyleSheet("background:#111; color:#8a8a8a; border:1px dashed #444;")
@@ -2069,24 +2301,6 @@ class InferenceWindow(QMainWindow):
         self.live_view_layout.addWidget(self.live_scroll, stretch=10)
         self.live_scroll.hide()
 
-        self.live_controls_toggle_btn = QPushButton("⚙", self.preview_tabs)
-        self.live_controls_toggle_btn.setFixedSize(40, 30)
-        self.live_controls_toggle_btn.clicked.connect(self._toggle_live_controls_panel)
-        self.live_controls_toggle_btn.setToolTip(
-            "Pokaz/ukryj kontrolki. "
-            "LPM na kaflu: pelny ekran/powrot, scroll: zoom, LPM+drag: pan, Esc: wyjscie z pelnego ekranu."
-        )
-        self.live_controls_toggle_btn.setStyleSheet(
-            "QPushButton {"
-            "background-color: rgba(20, 24, 31, 225);"
-            "color: #e7edf8;"
-            "border: 1px solid #4a5568;"
-            "border-radius: 6px;"
-            "font-size: 15px;"
-            "font-weight: 700;"
-            "}"
-            "QPushButton:hover { background-color: rgba(32, 38, 48, 235); }"
-        )
 
         self.live_header_toggle_btn = QPushButton(self.preview_tabs)
         self.live_header_toggle_btn.setFixedSize(34, 30)
@@ -2104,27 +2318,6 @@ class InferenceWindow(QMainWindow):
         )
         self._update_live_header_toggle_button()
 
-        self.live_controls_panel = QFrame(self.preview_tabs)
-        self.live_controls_panel.setFrameShape(QFrame.Shape.NoFrame)
-        panel_layout = QGridLayout(self.live_controls_panel)
-        panel_layout.setContentsMargins(10, 8, 10, 8)
-        panel_layout.setHorizontalSpacing(6)
-        panel_layout.setVerticalSpacing(6)
-        panel_layout.addWidget(self.start_live_btn, 0, 0)
-        panel_layout.addWidget(self.stop_live_btn, 0, 1)
-
-        self.start_live_btn.setMinimumWidth(86)
-        self.stop_live_btn.setMinimumWidth(86)
-
-        self.live_controls_panel.setStyleSheet(
-            "QFrame {"
-            "background-color: rgba(15, 20, 29, 230);"
-            "border: 1px solid #39485d;"
-            "border-radius: 8px;"
-            "}"
-        )
-        self.live_controls_panel.hide()
-        self.live_controls_toggle_btn.setText("⚙")
         self._update_live_overlay_margin()
         self._on_preview_subtab_changed(0)
 
@@ -2433,22 +2626,13 @@ class InferenceWindow(QMainWindow):
         recommended_entries: list[dict[str, Any]] = []
         older_entries: list[dict[str, Any]] = []
         for entry in installed_entries:
-            family = str(entry.get("family", "")).strip().lower()
-            kind = str(entry.get("kind", "")).strip().lower()
-            if family.startswith("yolo26") or kind.startswith("trained"):
+            if self._is_recommended_model_entry(entry):
                 recommended_entries.append(entry)
             else:
                 older_entries.append(entry)
 
-        def _sort_key(entry: dict[str, Any]) -> tuple[str, str, str]:
-            return (
-                str(entry.get("family", "")),
-                str(entry.get("kind", "")),
-                str(entry.get("display_name", "")),
-            )
-
-        recommended_entries.sort(key=_sort_key)
-        older_entries.sort(key=_sort_key)
+        recommended_entries.sort(key=self._model_catalog_sort_key)
+        older_entries.sort(key=self._model_catalog_sort_key)
 
         def _add_section(title: str, entries: list[dict[str, Any]]) -> None:
             if not entries:
@@ -2466,7 +2650,7 @@ class InferenceWindow(QMainWindow):
                 selection = self._build_model_selection(entry)
                 self.yolo_model_combo.addItem(label, selection)
 
-        _add_section("Zalecane", recommended_entries)
+        _add_section("Zalecane (najnowsze)", recommended_entries)
         _add_section("Starsze", older_entries)
 
         fallback_selection = current_selection
@@ -2518,7 +2702,7 @@ class InferenceWindow(QMainWindow):
         model_name = self._current_yolo_model_selection()["model_name"]
         matched_profile = self._match_yolo_profile(
             model_name=model_name,
-            target_fps=float(self.model_target_fps_spin.value()),
+            target_fps=float(int(self.model_target_fps_spin.value())),
             conf_value=float(self.conf_spin.value()),
             iou_value=float(self.iou_spin.value()),
             imgsz_value=self._current_imgsz_value(),
@@ -2540,7 +2724,7 @@ class InferenceWindow(QMainWindow):
     def _apply_yolo_profile_to_controls(self, profile_key: str) -> None:
         preset = YOLO_PROFILE_PRESETS.get(profile_key, YOLO_PROFILE_PRESETS["medium"])
         self._set_model_combo_value({"model_name": str(preset["model_name"]), "selected_model_path": ""})
-        self.model_target_fps_spin.setValue(float(preset["target_fps"]))
+        self.model_target_fps_spin.setValue(int(round(float(preset["target_fps"]))))
         self.conf_spin.setValue(float(preset["conf"]))
         self.iou_spin.setValue(float(preset["iou"]))
         self._set_imgsz_combo_value(int(preset["imgsz"]))
@@ -2566,7 +2750,7 @@ class InferenceWindow(QMainWindow):
             "Aplikacja ustawi: "
             f"model={current_model_name} | conf={self.conf_spin.value():.2f} | "
             f"IOU={self.iou_spin.value():.2f} | imgsz={self._current_imgsz_value()} | "
-            f"max_det={int(self.max_det_spin.value())} | fps_modelu={self.model_target_fps_spin.value():.1f}"
+            f"max_det={int(self.max_det_spin.value())} | fps_modelu={int(self.model_target_fps_spin.value())}"
         )
 
     def _on_yolo_profile_changed(self) -> None:
@@ -2595,6 +2779,7 @@ class InferenceWindow(QMainWindow):
         self._on_setting_changed()
 
     def _reload_model_from_config(self) -> None:
+        previous_model_reference = self.model_reference
         was_running = self.live_running
         if was_running:
             self.stop_live()
@@ -2610,6 +2795,11 @@ class InferenceWindow(QMainWindow):
         self._refresh_model_catalog()
         self._update_current_model_label()
         self._update_yolo_profile_summary()
+        if previous_model_reference != self.model_reference:
+            self._log(f"Model changed by config: {previous_model_reference} -> {self.model_reference}")
+        else:
+            self._log("Model reloaded due to config update (same model path).")
+        self._log_active_model_runtime(reason="config-reload")
 
         if was_running:
             self.start_live()
@@ -2651,7 +2841,9 @@ class InferenceWindow(QMainWindow):
         self._set_imgsz_combo_value(int(self.inference_cfg.get("imgsz", 960)))
         self.max_det_spin.setValue(int(self.inference_cfg.get("max_det", 100)))
         self.device_edit.setText(str(self.inference_cfg.get("device", "0")))
-        self.model_target_fps_spin.setValue(float(self.runtime_cfg.get("model_target_fps", self.model_target_fps)))
+        self.model_target_fps_spin.setValue(
+            int(round(float(self.runtime_cfg.get("model_target_fps", self.model_target_fps))))
+        )
         self.half_checkbox.setChecked(bool(self.inference_cfg.get("half", True)))
         self.compile_checkbox.setChecked(_is_compile_enabled(self.inference_cfg.get("compile", False)))
         self.start_maximized_checkbox.setChecked(bool(self.runtime_cfg.get("start_maximized", True)))
@@ -2660,6 +2852,7 @@ class InferenceWindow(QMainWindow):
         self.events_cooldown_spin.setValue(float(self.events_cfg.get("cooldown_seconds", 10.0)))
         self.events_linger_spin.setValue(float(self.events_cfg.get("linger_seconds", 1.5)))
         self.events_min_person_spin.setValue(int(self.events_cfg.get("min_person_count", 1)))
+        self.events_clip_fps_spin.setValue(int(round(float(self.events_cfg.get("clip_fps", 30.0)))))
         self.events_max_saved_spin.setValue(int(self.events_cfg.get("max_saved_events", 300)))
         self.events_save_annotated_checkbox.setChecked(bool(self.events_cfg.get("save_annotated_frame", True)))
         self.events_once_per_streak_checkbox.setChecked(bool(self.events_cfg.get("once_per_streak", True)))
@@ -2674,7 +2867,6 @@ class InferenceWindow(QMainWindow):
         if last_recording:
             self.recording_path_edit.setText(last_recording)
 
-        self.stop_live_btn.setEnabled(False)
         self._suppress_setting_autosave = False
 
     def _bind_setting_autosave(self) -> None:
@@ -2700,6 +2892,7 @@ class InferenceWindow(QMainWindow):
         self.events_cooldown_spin.valueChanged.connect(self._on_setting_changed)
         self.events_linger_spin.valueChanged.connect(self._on_setting_changed)
         self.events_min_person_spin.valueChanged.connect(self._on_setting_changed)
+        self.events_clip_fps_spin.valueChanged.connect(self._on_setting_changed)
         self.events_max_saved_spin.valueChanged.connect(self._on_setting_changed)
         self.events_save_annotated_checkbox.toggled.connect(self._on_setting_changed)
         self.events_once_per_streak_checkbox.toggled.connect(self._on_setting_changed)
@@ -2708,10 +2901,208 @@ class InferenceWindow(QMainWindow):
     def _on_setting_changed(self, *_args: Any) -> None:
         if self._suppress_setting_autosave:
             return
+        if not self._settings_change_tracking_ready:
+            return
 
-        self._settings_save_timer.start(self._settings_autosave_delay_ms)
+        self.settings_dirty = True
+        if hasattr(self, "settings_unsaved_label") and self.settings_unsaved_label is not None:
+            self.settings_unsaved_label.setVisible(True)
+
+    def _clear_settings_dirty(self) -> None:
+        self.settings_dirty = False
+        if hasattr(self, "settings_unsaved_label") and self.settings_unsaved_label is not None:
+            self.settings_unsaved_label.setVisible(False)
+
+    def _confirm_and_save_settings(self) -> None:
+        self._commit_pending_settings()
+        self._clear_settings_dirty()
+
+    def _discard_pending_settings(self) -> None:
+        self._suppress_setting_autosave = True
+        try:
+            self._set_controls_from_config()
+        finally:
+            self._suppress_setting_autosave = False
+        self._clear_settings_dirty()
+        self._log("Niezapisane zmiany ustawien zostaly odrzucone.")
+
+    def _reset_settings_to_defaults(self) -> None:
+        reply = QMessageBox.question(
+            self,
+            "Reset ustawien",
+            "Przywrocic domyslne ustawienia z pliku konfiguracyjnego?\nZmiany beda wymagaly potwierdzenia zapisu.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        try:
+            defaults = load_yaml(self.config_path)
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.critical(self, "Reset ustawien", f"Nie mozna wczytac domyslnych ustawien:\n{exc}")
+            return
+
+        if not isinstance(defaults, dict):
+            QMessageBox.critical(self, "Reset ustawien", "Domyslny config ma nieprawidlowy format.")
+            return
+
+        for key in ("model", "inference", "tracker", "security", "events", "runtime"):
+            self.config[key] = dict(defaults.get(key, {}) or {})
+
+        self.model_cfg = dict(self.config.get("model", {}) or {})
+        self.inference_cfg = dict(self.config.get("inference", {}) or {})
+        self.security_cfg = dict(self.config.get("security", {}) or {})
+        self.runtime_cfg = dict(self.config.get("runtime", {}) or {})
+        self.tracker_cfg = dict(self.config.get("tracker", {}) or {})
+        self.events_cfg = dict(self.config.get("events", {}) or {})
+
+        self._suppress_setting_autosave = True
+        try:
+            self._set_controls_from_config()
+        finally:
+            self._suppress_setting_autosave = False
+        self._on_setting_changed()
+        self._log("Przywrocono domyslne ustawienia (oczekuja na potwierdzenie zapisu).")
+
+    def _save_settings_preset(self) -> None:
+        preset_name, ok = QInputDialog.getText(self, "Zapisz preset", "Nazwa presetu:")
+        if not ok:
+            return
+        preset_name = str(preset_name).strip()
+        if not preset_name:
+            QMessageBox.information(self, "Preset", "Podaj nazwe presetu.")
+            return
+
+        self._apply_controls_to_runtime_state()
+        payload = {
+            "model": dict(self.model_cfg),
+            "inference": dict(self.inference_cfg),
+            "tracker": dict(self.tracker_cfg),
+            "security": dict(self.security_cfg),
+            "events": dict(self.events_cfg),
+            "runtime": dict(self.runtime_cfg),
+        }
+
+        presets_dir = self.app_settings_dir / "presets"
+        presets_dir.mkdir(parents=True, exist_ok=True)
+        preset_file = presets_dir / f"{_safe_file_part(preset_name, fallback='preset')}.yaml"
+        try:
+            save_yaml(preset_file, payload)
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.critical(self, "Preset", f"Nie mozna zapisac presetu:\n{exc}")
+            return
+
+        previous_settings = self._snapshot_settings_state()
+        self.runtime_cfg["active_settings_preset"] = _to_relative_or_abs(preset_file)
+        self._persist_config(show_message=False, previous_settings=previous_settings)
+        self._clear_settings_dirty()
+
+        self._log(f"Preset zapisany i aktywowany: {preset_file}")
+        QMessageBox.information(self, "Preset", f"Zapisano i aktywowano preset:\n{preset_file}")
+
+    def _available_settings_presets(self) -> list[Path]:
+        presets_dir = self.app_settings_dir / "presets"
+        if not presets_dir.exists():
+            return []
+        return sorted(presets_dir.glob("*.yaml"), key=lambda path: path.name.lower())
+
+    def _load_settings_preset(self) -> None:
+        preset_files = self._available_settings_presets()
+        if not preset_files:
+            QMessageBox.information(self, "Preset", "Brak zapisanych presetow.")
+            return
+
+        options = [preset_file.stem for preset_file in preset_files]
+        selected_name, ok = QInputDialog.getItem(
+            self,
+            "Wczytaj preset",
+            "Wybierz preset:",
+            options,
+            0,
+            False,
+        )
+        if not ok:
+            return
+
+        selected_name = str(selected_name).strip()
+        selected_file = next((path for path in preset_files if path.stem == selected_name), None)
+        if selected_file is None:
+            QMessageBox.critical(self, "Preset", "Nie znaleziono wybranego presetu.")
+            return
+
+        try:
+            payload = load_yaml(selected_file)
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.critical(self, "Preset", f"Nie mozna wczytac presetu:\n{exc}")
+            return
+        if not isinstance(payload, dict):
+            QMessageBox.critical(self, "Preset", "Plik presetu ma nieprawidlowy format.")
+            return
+
+        previous_settings = self._snapshot_settings_state()
+        for key in ("model", "inference", "tracker", "security", "events", "runtime"):
+            if key in payload and isinstance(payload.get(key), dict):
+                self.config[key] = dict(payload.get(key, {}) or {})
+
+        self.model_cfg = dict(self.config.get("model", {}) or {})
+        self.inference_cfg = dict(self.config.get("inference", {}) or {})
+        self.security_cfg = dict(self.config.get("security", {}) or {})
+        self.runtime_cfg = dict(self.config.get("runtime", {}) or {})
+        self.tracker_cfg = dict(self.config.get("tracker", {}) or {})
+        self.events_cfg = dict(self.config.get("events", {}) or {})
+        self.runtime_cfg["active_settings_preset"] = _to_relative_or_abs(selected_file)
+
+        self._suppress_setting_autosave = True
+        try:
+            self._set_controls_from_config()
+        finally:
+            self._suppress_setting_autosave = False
+
+        self._commit_pending_settings()
+        self._clear_settings_dirty()
+        self._log(f"Preset wczytany i aktywowany: {selected_file}")
+        QMessageBox.information(self, "Preset", f"Wczytano preset:\n{selected_file}")
+
+    def _on_main_tab_changed(self, index: int) -> None:
+        if self._suppress_main_tab_change_handler:
+            self._last_main_tab_index = index
+            return
+        if self._settings_tab_index < 0:
+            self._last_main_tab_index = index
+            return
+
+        leaving_settings = self._last_main_tab_index == self._settings_tab_index and index != self._settings_tab_index
+        if leaving_settings and self.settings_dirty:
+            box = QMessageBox(self)
+            box.setIcon(QMessageBox.Icon.Warning)
+            box.setWindowTitle("Niezapisane zmiany")
+            box.setText("Masz niezapisane zmiany w Ustawieniach.")
+            box.setInformativeText("Wybierz, co zrobic przed opuszczeniem zakladki.")
+            save_btn = box.addButton("Potwierdz i zapisz", QMessageBox.ButtonRole.AcceptRole)
+            discard_btn = box.addButton("Odrzuc zmiany", QMessageBox.ButtonRole.DestructiveRole)
+            cancel_btn = box.addButton("Wroc", QMessageBox.ButtonRole.RejectRole)
+            box.setDefaultButton(save_btn)
+            box.exec()
+            clicked = box.clickedButton()
+
+            if clicked == save_btn:
+                self._confirm_and_save_settings()
+            elif clicked == discard_btn:
+                self._discard_pending_settings()
+            else:
+                self._suppress_main_tab_change_handler = True
+                try:
+                    self.main_tabs.setCurrentIndex(self._settings_tab_index)
+                finally:
+                    self._suppress_main_tab_change_handler = False
+                self._last_main_tab_index = self._settings_tab_index
+                return
+
+        self._last_main_tab_index = index
 
     def _commit_pending_settings(self) -> None:
+        previous_settings = self._snapshot_settings_state()
         self._apply_controls_to_runtime_state()
         ensure_windows_compile_env(self.inference_cfg, compile_value=self.inference_cfg.get("compile", False))
         if self._model_config_requires_reload():
@@ -2721,14 +3112,166 @@ class InferenceWindow(QMainWindow):
                 return
         self._rebuild_predict_kwargs()
         self._update_yolo_profile_summary()
-        self._persist_config(show_message=False)
+        self._persist_config(show_message=False, previous_settings=previous_settings)
 
     def _flush_pending_settings(self) -> None:
         if self._settings_save_timer.isActive():
             self._settings_save_timer.stop()
-            self._commit_pending_settings()
 
     # ---------- model list ----------
+    def _is_recommended_model_entry(self, entry: dict[str, Any]) -> bool:
+        latest_major = self._latest_recommended_series_major()
+        if latest_major < 0:
+            return False
+        series_key = self._extract_model_series_key(entry)
+        series_major = self._extract_series_major(series_key)
+        return series_major == latest_major
+
+    def _extract_model_series_key(self, entry: dict[str, Any]) -> str:
+        family = str(entry.get("family", "")).strip().lower()
+        model_name = str(entry.get("model_name", entry.get("name", ""))).strip().lower()
+        for text in (family, model_name):
+            match = re.search(r"(yolo(?:v?\d+))", text)
+            if match is not None:
+                return str(match.group(1)).lower()
+        return ""
+
+    def _extract_series_major(self, series_key: str) -> int:
+        match = re.search(r"yolov?(\d+)", str(series_key or "").lower())
+        if match is None:
+            return -1
+        try:
+            return int(match.group(1))
+        except Exception:  # noqa: BLE001
+            return -1
+
+    def _latest_recommended_series_major(self) -> int:
+        majors: list[int] = []
+
+        for entry in self.model_catalog:
+            if bool(entry.get("missing", False)):
+                continue
+            series_key = self._extract_model_series_key(entry)
+            major = self._extract_series_major(series_key)
+            if major >= 0:
+                majors.append(major)
+
+        for preset in YOLO_PROFILE_PRESETS.values():
+            model_name = str((preset or {}).get("model_name", "")).strip()
+            if not model_name:
+                continue
+            series_key = self._extract_model_series_key({"model_name": model_name})
+            major = self._extract_series_major(series_key)
+            if major >= 0:
+                majors.append(major)
+
+        configured_name = str(self.model_cfg.get("name", "")).strip()
+        if configured_name:
+            series_key = self._extract_model_series_key({"model_name": configured_name})
+            major = self._extract_series_major(series_key)
+            if major >= 0:
+                majors.append(major)
+
+        if not majors:
+            return -1
+        return max(majors)
+
+    def _fetch_online_suggested_model_names(self) -> set[str]:
+        if self._online_model_suggestions_cache is not None:
+            return set(self._online_model_suggestions_cache)
+
+        if not bool(self.runtime_cfg.get("online_model_catalog_enabled", True)):
+            self._online_model_suggestions_cache = set()
+            return set()
+
+        model_names: set[str] = set()
+        url = "https://api.github.com/repos/ultralytics/assets/releases"
+        request = urllib.request.Request(
+            url,
+            headers={
+                "Accept": "application/vnd.github+json",
+                "User-Agent": "intrusion-detection-app",
+            },
+        )
+
+        try:
+            with urllib.request.urlopen(request, timeout=4.0) as response:  # noqa: S310
+                payload = response.read().decode("utf-8", errors="ignore")
+            parsed = json.loads(payload)
+            releases = parsed if isinstance(parsed, list) else []
+            for release in releases:
+                assets = release.get("assets", []) if isinstance(release, dict) else []
+                if not isinstance(assets, list):
+                    continue
+                for asset in assets:
+                    if not isinstance(asset, dict):
+                        continue
+                    name = str(asset.get("name", "")).strip().lower()
+                    if re.fullmatch(r"yolo(?:v?\d+)[nslmx]\.pt", name):
+                        model_names.add(name)
+        except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError) as exc:
+            if not self._online_model_suggestions_error_logged:
+                self._log(f"Nie udalo sie pobrac listy modeli online: {exc}")
+                self._online_model_suggestions_error_logged = True
+
+        self._online_model_suggestions_cache = set(model_names)
+        return set(model_names)
+
+    def _model_version_group_label(self, entry: dict[str, Any]) -> str:
+        series_key = self._extract_model_series_key(entry)
+        latest_major = self._latest_recommended_series_major()
+        series_major = self._extract_series_major(series_key)
+        if series_key and series_major == latest_major:
+            return f"Modele najnowsze ({series_key.upper()}) - zalecane"
+        if series_key:
+            return f"Modele {series_key.upper()}"
+        if bool(entry.get("missing", False)):
+            return "Do pobrania"
+        return "Inne modele"
+
+    def _model_version_group_rank(self, entry: dict[str, Any]) -> tuple[int, int]:
+        series_key = self._extract_model_series_key(entry)
+        latest_major = self._latest_recommended_series_major()
+        if series_key:
+            major = self._extract_series_major(series_key)
+            if major == latest_major:
+                return (0, -major)
+            if major < 0:
+                return (2, 0)
+            return (1, -major)
+        if bool(entry.get("missing", False)):
+            return (3, 0)
+        return (2, 0)
+
+    def _model_series_rank(self, family: str) -> int:
+        value = str(family or "").strip().lower()
+        major = self._extract_series_major(value)
+        if major >= 0:
+            return 100 - major
+        return 999
+
+    def _model_size_rank(self, family: str, model_name: str) -> int:
+        text = str(family or model_name or "").strip().lower()
+        variant_order = {"n": 0, "s": 1, "m": 2, "l": 3, "x": 4}
+        if not text:
+            return 99
+        suffix = text[-1]
+        return variant_order.get(suffix, 99)
+
+    def _model_catalog_sort_key(self, entry: dict[str, Any]) -> tuple[tuple[int, int], int, int, int, float, str]:
+        group_rank = self._model_version_group_rank(entry)
+        recommended_rank = 0 if self._is_recommended_model_entry(entry) else 1
+
+        family = str(entry.get("family", "")).strip().lower()
+        model_name = str(entry.get("model_name", entry.get("name", ""))).strip().lower()
+        series_rank = self._model_series_rank(family)
+        size_rank = self._model_size_rank(family, model_name)
+
+        # Najnowsze pliki (po czasie modyfikacji) ida wyzej w tej samej grupie.
+        updated_ts = float(entry.get("updated_ts", 0.0) or 0.0)
+        display_name = str(entry.get("display_name", entry.get("name", ""))).strip().lower()
+        return (group_rank, recommended_rank, series_rank, size_rank, -updated_ts, display_name)
+
     def _collect_run_metrics(self) -> tuple[dict[str, dict[str, Any]], str | None]:
         logs_dir = resolve_path("logs/train")
         if not logs_dir.exists():
@@ -2841,10 +3384,14 @@ class InferenceWindow(QMainWindow):
                     run_name = meta_run
 
             size_mb: float | None = None
+            updated_ts = 0.0
             try:
-                size_mb = path.stat().st_size / (1024 * 1024)
+                stat_result = path.stat()
+                size_mb = stat_result.st_size / (1024 * 1024)
+                updated_ts = float(stat_result.st_mtime)
             except Exception:  # noqa: BLE001
                 size_mb = None
+                updated_ts = 0.0
 
             params_m = None
             gflops = None
@@ -2898,27 +3445,36 @@ class InferenceWindow(QMainWindow):
                     "size_mb": size_mb,
                     "task": task,
                     "nc": nc,
+                    "updated_ts": updated_ts,
                     "missing": False,
                 }
             )
 
-        suggested_names = [
-            "yolo26n.pt",
-            "yolo26s.pt",
-            "yolo26m.pt",
-            "yolo26l.pt",
-            "yolo26x.pt",
-            "yolov8n.pt",
-            "yolov8s.pt",
-            "yolov8m.pt",
-            "yolov8l.pt",
-            "yolov8x.pt",
-            "yolov5n.pt",
-            "yolov5s.pt",
-            "yolov5m.pt",
-            "yolov5l.pt",
-            "yolov5x.pt",
-        ]
+        suggested_names_set: set[str] = set()
+        for preset in YOLO_PROFILE_PRESETS.values():
+            preset_model_name = str((preset or {}).get("model_name", "")).strip()
+            if preset_model_name:
+                suggested_names_set.add(preset_model_name)
+
+        selected_model_name = str(self.model_cfg.get("name", "")).strip()
+        if selected_model_name:
+            if not selected_model_name.lower().endswith(".pt"):
+                selected_model_name = f"{selected_model_name}.pt"
+            suggested_names_set.add(selected_model_name)
+
+        configured_suggestions = self.model_cfg.get("suggested_models", [])
+        if isinstance(configured_suggestions, list):
+            for item in configured_suggestions:
+                model_name = str(item or "").strip()
+                if not model_name:
+                    continue
+                if not model_name.lower().endswith(".pt"):
+                    model_name = f"{model_name}.pt"
+                suggested_names_set.add(model_name)
+
+        suggested_names_set.update(self._fetch_online_suggested_model_names())
+
+        suggested_names = sorted(suggested_names_set)
         existing_names = {entry["name"] for entry in entries}
         for model_name in suggested_names:
             if model_name in existing_names:
@@ -2942,10 +3498,12 @@ class InferenceWindow(QMainWindow):
                     "size_mb": None,
                     "task": None,
                     "nc": None,
+                    "updated_ts": 0.0,
                     "missing": True,
                 }
             )
 
+        entries.sort(key=self._model_catalog_sort_key)
         self.model_catalog = entries
         self._populate_model_table()
         if hasattr(self, "yolo_model_combo") and self.yolo_model_combo is not None:
@@ -2990,30 +3548,62 @@ class InferenceWindow(QMainWindow):
         self._update_yolo_profile_summary()
 
     def _populate_model_table(self) -> None:
-        self.model_table.setRowCount(len(self.model_catalog))
+        rows: list[tuple[str, int | None]] = []
+        last_group_label: str | None = None
+        for catalog_index, entry in enumerate(self.model_catalog):
+            group_label = self._model_version_group_label(entry)
+            if group_label != last_group_label:
+                rows.append(("header", None))
+                last_group_label = group_label
+            rows.append(("entry", catalog_index))
+
+        self.model_table_row_map = [row_index for _, row_index in rows]
+        self.model_table.clearSpans()
+        self.model_table.setRowCount(len(rows))
 
         selected_row = -1
         current_path_str = str(self.current_model_path.resolve()) if self.current_model_path and self.current_model_path.exists() else ""
 
-        for row, entry in enumerate(self.model_catalog):
-            map50 = entry["map50"]
-            map5095 = entry["map5095"]
+        for row, (row_type, catalog_index) in enumerate(rows):
+            if row_type == "header":
+                header_entry: dict[str, Any] | None = None
+                if row + 1 < len(rows) and rows[row + 1][1] is not None:
+                    header_entry = self.model_catalog[int(rows[row + 1][1])]
+
+                header_text = "Modele"
+                if header_entry is not None:
+                    header_text = self._model_version_group_label(header_entry)
+
+                self.model_table.setSpan(row, 0, 1, 7)
+                header_item = QTableWidgetItem(header_text)
+                header_item.setForeground(QColor("#8fb2ff"))
+                header_item.setBackground(QColor("#1a2333"))
+                header_item.setFlags(Qt.ItemFlag.ItemIsEnabled)
+                self.model_table.setItem(row, 0, header_item)
+                continue
+
+            if catalog_index is None:
+                continue
+
+            entry = self.model_catalog[int(catalog_index)]
             size_mb = entry.get("size_mb")
 
             available = "✓" if not entry.get("missing", False) else "✗"
             available_item = QTableWidgetItem(available)
             available_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
             self.model_table.setItem(row, 0, available_item)
-            self.model_table.setItem(row, 1, QTableWidgetItem(str(entry["display_name"])))
+
+            model_item = QTableWidgetItem(str(entry["display_name"]))
+            if self._is_recommended_model_entry(entry):
+                model_item.setForeground(QColor("#7ee787"))
+            self.model_table.setItem(row, 1, model_item)
             self.model_table.setItem(row, 2, QTableWidgetItem(str(entry["kind"])))
             self.model_table.setItem(row, 3, QTableWidgetItem(str(entry["family"])))
-            self.model_table.setItem(row, 4, QTableWidgetItem("-" if map50 is None else f"{map50:.4f}"))
-            self.model_table.setItem(row, 5, QTableWidgetItem("-" if map5095 is None else f"{map5095:.4f}"))
-            self.model_table.setItem(row, 6, QTableWidgetItem("-" if size_mb is None else f"{size_mb:.1f}"))
-            self.model_table.setItem(row, 7, QTableWidgetItem(str(entry["run"])))
-            self.model_table.setItem(row, 8, QTableWidgetItem(str(entry["path_display"])))
+            self.model_table.setItem(row, 4, QTableWidgetItem("-" if size_mb is None else f"{size_mb:.1f}"))
+            self.model_table.setItem(row, 5, QTableWidgetItem(str(entry["run"])))
+            self.model_table.setItem(row, 6, QTableWidgetItem(str(entry["path_display"])))
 
-            if current_path_str and str(entry["path"]) == current_path_str:
+            if current_path_str and str(entry["path"].resolve()) == current_path_str:
                 selected_row = row
 
         if selected_row >= 0:
@@ -3023,11 +3613,16 @@ class InferenceWindow(QMainWindow):
 
     def _apply_selected_model(self) -> None:
         row = self.model_table.currentRow()
-        if row < 0 or row >= len(self.model_catalog):
+        if row < 0 or row >= len(self.model_table_row_map):
             QMessageBox.information(self, "Model", "Najpierw wybierz wiersz modelu.")
             return
 
-        entry = self.model_catalog[row]
+        catalog_index = self.model_table_row_map[row]
+        if catalog_index is None or catalog_index < 0 or catalog_index >= len(self.model_catalog):
+            QMessageBox.information(self, "Model", "Najpierw wybierz wiersz modelu.")
+            return
+
+        entry = self.model_catalog[catalog_index]
         model_path = Path(entry["path"]).resolve()
         missing = bool(entry.get("missing", False)) or not model_path.exists()
         if missing:
@@ -3727,6 +4322,23 @@ class InferenceWindow(QMainWindow):
                 self.source_table.setCellWidget(row, 5, cell)
         finally:
             self._table_updating = False
+            self._update_source_table_height()
+
+    def _update_source_table_height(self) -> None:
+        if not hasattr(self, "source_table") or self.source_table is None:
+            return
+
+        row_count = int(self.source_table.rowCount())
+        min_rows = max(1, int(self._source_table_min_visible_rows))
+        max_rows = max(min_rows, int(self._source_table_max_visible_rows))
+        visible_rows = min(max(row_count, min_rows), max_rows)
+
+        header_h = self.source_table.horizontalHeader().height()
+        row_h = self.source_table.verticalHeader().defaultSectionSize()
+        frame_h = self.source_table.frameWidth() * 2
+        target_height = int(header_h + frame_h + (visible_rows * row_h) + 4)
+
+        self.source_table.setFixedHeight(target_height)
 
     def _on_source_item_changed(self, item: QTableWidgetItem) -> None:
         if self._table_updating:
@@ -4099,25 +4711,10 @@ class InferenceWindow(QMainWindow):
     def _toggle_live_tile_header_visibility(self) -> None:
         self._set_live_tile_header_visibility(not self.live_tile_header_visible, persist=True)
 
-    def _toggle_live_controls_panel(self) -> None:
-        if hasattr(self, "preview_tabs") and self.preview_tabs.currentIndex() != 0:
-            return
-        visible = not self.live_controls_panel.isVisible()
-        self.live_controls_panel.setVisible(visible)
-        self.live_controls_toggle_btn.setText("✕" if visible else "⚙")
-        self._update_live_overlay_margin()
-        self._position_overlay_controls()
-
     def _on_preview_subtab_changed(self, index: int) -> None:
-        if not hasattr(self, "live_controls_toggle_btn") or not hasattr(self, "live_controls_panel"):
-            return
         is_live = int(index) == 0
-        self.live_controls_toggle_btn.setVisible(is_live)
         if hasattr(self, "live_header_toggle_btn") and self.live_header_toggle_btn is not None:
             self.live_header_toggle_btn.setVisible(is_live)
-        if not is_live:
-            self.live_controls_panel.hide()
-            self.live_controls_toggle_btn.setText("⚙")
         self._position_overlay_controls()
 
     def _update_live_overlay_margin(self) -> None:
@@ -4145,11 +4742,7 @@ class InferenceWindow(QMainWindow):
             self.navigation_overlay_btn.move(0, 2)
             self.navigation_overlay_btn.raise_()
 
-        if (
-            hasattr(self, "preview_tabs")
-            and self.preview_tabs is not None
-            and self.live_controls_toggle_btn is not None
-        ):
+        if hasattr(self, "preview_tabs") and self.preview_tabs is not None:
             container = self.preview_tabs
             if container.currentIndex() != 0:
                 return
@@ -4164,26 +4757,13 @@ class InferenceWindow(QMainWindow):
                     self.navigation_overlay_btn.y() + self.navigation_overlay_btn.height() + 8,
                 )
 
-            toggle_h = self.live_controls_toggle_btn.height()
-            toggle_x = max(side_margin, container.width() - self.live_controls_toggle_btn.width() - side_margin)
             toggle_y = controls_y
-            self.live_controls_toggle_btn.move(toggle_x, toggle_y)
-            self.live_controls_toggle_btn.raise_()
 
             if hasattr(self, "live_header_toggle_btn") and self.live_header_toggle_btn is not None:
                 header_toggle_x = side_margin
                 header_toggle_y = toggle_y
                 self.live_header_toggle_btn.move(header_toggle_x, header_toggle_y)
                 self.live_header_toggle_btn.raise_()
-
-            if self.live_controls_panel.isVisible():
-                self.live_controls_panel.adjustSize()
-                panel_max_width = max(320, int(container.width() * 0.72))
-                self.live_controls_panel.setMaximumWidth(panel_max_width)
-                panel_x = max(side_margin, container.width() - self.live_controls_panel.width() - side_margin)
-                panel_y = toggle_y + toggle_h + 8
-                self.live_controls_panel.move(panel_x, panel_y)
-                self.live_controls_panel.raise_()
 
     def _on_tile_zoom_delta(self, source_name: str, delta: int) -> None:
         if self.focused_source != source_name:
@@ -4278,7 +4858,7 @@ class InferenceWindow(QMainWindow):
             total = len(source_names)
             start = self._infer_worker_rr_cursor % total
             ordered = [source_names[(start + idx) % total] for idx in range(total)]
-            chosen = ordered[: max(1, int(self.max_infer_per_tick))]
+            chosen = ordered[: self._effective_max_infer_per_tick()]
             self._infer_worker_rr_cursor = (start + len(chosen)) % max(1, total)
 
             batch_sources: list[str] = []
@@ -4407,8 +4987,71 @@ class InferenceWindow(QMainWindow):
             runtime.status = "alert" if payload.alert else "ok"
         return True
 
+    def _update_load_shed_state(self, now_ts: float) -> None:
+        if self._load_shed_level <= 0.0:
+            return
+
+        if now_ts < self._load_shed_decay_block_until_ts:
+            return
+
+        if (now_ts - self._load_shed_last_pressure_ts) < self._load_shed_hold_seconds:
+            return
+
+        new_level = max(0.0, self._load_shed_level - (self._load_shed_decay_per_sec * max(0.0, self.frame_interval_ms) / 1000.0))
+        if abs(new_level - self._load_shed_level) < 1e-6:
+            return
+        self._load_shed_level = new_level
+
+        if self._load_shed_level <= 0.0 and (now_ts - self._load_shed_last_log_ts) >= 2.0:
+            self._load_shed_last_log_ts = now_ts
+            self._log("[info] Obciazenie wrocilo do normy. Przywracam pelna plynnosc podgladu i inferencji.")
+
+    def _register_event_writer_pressure(self) -> None:
+        now_ts = time.perf_counter()
+        self._load_shed_last_pressure_ts = now_ts
+        self._load_shed_decay_block_until_ts = max(self._load_shed_decay_block_until_ts, now_ts + self._load_shed_sticky_seconds)
+        if self._load_shed_level <= 0.0:
+            self._load_shed_level = self._load_shed_initial_level
+        else:
+            self._load_shed_level = min(1.0, self._load_shed_level + 0.25)
+
+        if (now_ts - self._load_shed_last_log_ts) >= 2.0:
+            self._load_shed_last_log_ts = now_ts
+            effective_view_fps = self._effective_view_target_fps()
+            effective_model_fps = self._effective_model_target_fps()
+            self._log(
+                "[warn] Wykryto przeciazenie zapisu klipow. "
+                "Tymczasowo ograniczam obciazenie "
+                f"(view_fps~{effective_view_fps:.1f}, model_fps~{effective_model_fps:.1f}) "
+                f"na co najmniej {self._load_shed_sticky_seconds:.0f}s."
+            )
+
+    def _effective_view_target_fps(self) -> float:
+        configured = float(_clamp(float(self.view_target_fps), 1.0, 60.0))
+        if self._load_shed_level <= 0.0:
+            return configured
+        reduction_factor = 1.0 - (0.60 * self._load_shed_level)
+        reduced = configured * max(0.10, reduction_factor)
+        return max(self._load_shed_min_view_fps, reduced)
+
+    def _effective_model_target_fps(self) -> float:
+        configured = max(1.0, float(self.model_target_fps))
+        if self._load_shed_level <= 0.0:
+            return configured
+        reduction_factor = 1.0 - (0.65 * self._load_shed_level)
+        reduced = configured * max(0.10, reduction_factor)
+        return max(self._load_shed_min_model_fps, reduced)
+
+    def _effective_max_infer_per_tick(self) -> int:
+        base = max(1, int(self.max_infer_per_tick))
+        if self._load_shed_level <= 0.0:
+            return base
+        if self._load_shed_level >= 0.50:
+            return 1
+        return max(1, base - 1)
+
     def _compute_effective_view_fps_cap(self) -> float:
-        configured_cap = float(_clamp(float(self.view_target_fps), 1.0, 60.0))
+        configured_cap = self._effective_view_target_fps()
         if not bool(self.runtime_cfg.get("view_cap_to_source_fps", True)):
             return configured_cap
         enabled_sources = self._get_enabled_sources()
@@ -4982,6 +5625,7 @@ class InferenceWindow(QMainWindow):
 
     def _tick_live(self) -> None:
         now_ts = time.perf_counter()
+        self._update_load_shed_state(now_ts)
         self._maybe_adjust_live_timer_interval(now_ts)
 
         if not self._apply_async_inference_updates():
@@ -4991,7 +5635,7 @@ class InferenceWindow(QMainWindow):
         if not enabled_sources:
             return
 
-        infer_interval_sec = 1.0 / max(0.1, self.model_target_fps)
+        infer_interval_sec = 1.0 / max(1.0, self._effective_model_target_fps())
         latest_frames: dict[str, np.ndarray] = {}
         source_names: list[str] = []
 
@@ -5093,8 +5737,6 @@ class InferenceWindow(QMainWindow):
         self._live_timer_last_adjust_ts = time.perf_counter()
         self.live_timer.start(self._live_timer_interval_ms)
         self.live_running = True
-        self.start_live_btn.setEnabled(False)
-        self.stop_live_btn.setEnabled(True)
         self._log(
             "Live inference started "
             f"(view_target_fps={self.view_target_fps:.1f}, timer={self._live_timer_interval_ms}ms)."
@@ -5108,9 +5750,6 @@ class InferenceWindow(QMainWindow):
         self._stop_inference_worker()
         self.live_running = False
         self._live_timer_last_adjust_ts = 0.0
-        self.start_live_btn.setEnabled(True)
-        self.stop_live_btn.setEnabled(False)
-
         stop_ts = time.perf_counter()
         for source_name, runtime in self.runtimes.items():
             self._finalize_event_clip(source_name, runtime, stop_ts)
@@ -5911,7 +6550,11 @@ class InferenceWindow(QMainWindow):
                     runtime.event_clip_frames_written += 1
                 except Exception:  # noqa: BLE001
                     runtime.event_clip_failed = True
-                    self._queue_async_notice(f"[warn] failed to write event clip frame for '{source_name}'")
+                    self._queue_async_notice(
+                        f"[warn] Blad zapisu klatki klipu zdarzenia dla '{source_name}'. "
+                        "Sprobuj zmniejszyc liczbe klatek (model_target_fps/view_target_fps) "
+                        "lub liczbe aktywnych zrodel."
+                    )
 
             with self._event_writer_cond:
                 pending = int(self._event_writer_pending.get(key, 0))
@@ -5964,8 +6607,12 @@ class InferenceWindow(QMainWindow):
                 self._event_writer_pending[key] = pending + 1
             self._event_writer_cond.notify()
         if should_log_drop:
+            self._register_event_writer_pressure()
             self._queue_async_notice(
-                f"[warn] event clip queue full for '{source_name}', dropping stale frames to keep UI responsive"
+                f"[warn] Kolejka zapisu klipu zdarzenia jest pelna dla '{source_name}'. "
+                "Pomijam najstarsze klatki, aby UI pozostalo plynne. "
+                "Sprobuj zmniejszyc liczbe klatek (model_target_fps/view_target_fps), "
+                "rozdzielczosc lub liczbe aktywnych zrodel."
             )
 
     def _wait_for_event_clip_flush(self, source_name: str, generation: int, timeout_sec: float = 0.35) -> None:
@@ -6069,7 +6716,9 @@ class InferenceWindow(QMainWindow):
                     temp_path.unlink()
             except Exception:  # noqa: BLE001
                 pass
-            self._queue_async_notice(f"[warn] failed to finalize event clip for '{source_name}'")
+            self._queue_async_notice(
+                f"[warn] Nie udalo sie domknac i zapisac klipu zdarzenia dla '{source_name}'."
+            )
             return
 
         entry = {
@@ -6108,14 +6757,7 @@ class InferenceWindow(QMainWindow):
         self.events_output_dir.mkdir(parents=True, exist_ok=True)
         height, width = frame.shape[:2]
         frame_size = (int(width), int(height))
-        fps_candidates = [
-            float(runtime.source_fps),
-            float(runtime.fps),
-            float(self.runtime_cfg.get("video_fps_fallback", 25.0)),
-            float(self.model_target_fps),
-            float(self.view_target_fps),
-        ]
-        clip_fps = next((fps for fps in fps_candidates if fps > 1e-3), 25.0)
+        clip_fps = max(1.0, float(self.events_clip_fps))
 
         wall_ts = runtime.event_clip_started_wall_ts if runtime.event_clip_started_wall_ts > 0.0 else time.time()
         runtime.event_clip_started_wall_ts = wall_ts
@@ -6128,7 +6770,10 @@ class InferenceWindow(QMainWindow):
 
         writer, temp_path = _open_event_video_writer(temp_base, fps=clip_fps, frame_size=frame_size)
         if writer is None or temp_path is None:
-            self._queue_async_notice(f"[warn] failed to initialize event clip writer for '{source_name}'")
+            self._queue_async_notice(
+                f"[warn] Nie udalo sie uruchomic zapisu klipu zdarzenia dla '{source_name}'. "
+                "Sprawdz uprawnienia do folderu zapisu i obciazenie dysku."
+            )
             self._clear_event_clip_state(runtime, delete_temp_file=True)
             return False
 
@@ -6263,8 +6908,8 @@ class InferenceWindow(QMainWindow):
         self.runtime_cfg["loop_videos"] = bool(self.loop_videos)
         self.runtime_cfg["frame_interval_ms"] = int(self.frame_interval_ms)
         self.runtime_cfg["view_target_fps"] = float(self.view_target_fps)
-        self.model_target_fps = float(self.model_target_fps_spin.value())
-        self.runtime_cfg["model_target_fps"] = float(self.model_target_fps)
+        self.model_target_fps = int(self.model_target_fps_spin.value())
+        self.runtime_cfg["model_target_fps"] = int(self.model_target_fps)
         self.runtime_cfg["max_infer_per_tick"] = int(self.max_infer_per_tick)
         self.runtime_cfg["live_tile_spacing"] = int(self.live_tile_spacing)
         self.runtime_cfg["show_live_tile_headers"] = bool(self.live_tile_header_visible)
@@ -6282,6 +6927,7 @@ class InferenceWindow(QMainWindow):
         self.events_cfg["cooldown_seconds"] = float(self.events_cooldown_spin.value())
         self.events_cfg["linger_seconds"] = float(self.events_linger_spin.value())
         self.events_cfg["min_person_count"] = int(self.events_min_person_spin.value())
+        self.events_cfg["clip_fps"] = int(self.events_clip_fps_spin.value())
         self.events_cfg["max_saved_events"] = int(self.events_max_saved_spin.value())
         self.events_cfg["save_annotated_frame"] = bool(self.events_save_annotated_checkbox.isChecked())
         self.events_cfg["once_per_streak"] = bool(self.events_once_per_streak_checkbox.isChecked())
@@ -6293,6 +6939,7 @@ class InferenceWindow(QMainWindow):
         self.events_cooldown_seconds = max(0.0, float(self.events_cfg["cooldown_seconds"]))
         self.events_linger_seconds = max(0.0, float(self.events_cfg["linger_seconds"]))
         self.events_min_person_count = max(1, int(self.events_cfg["min_person_count"]))
+        self.events_clip_fps = max(1.0, float(self.events_cfg["clip_fps"]))
         self.events_max_saved = max(0, int(self.events_cfg["max_saved_events"]))
         self.events_save_annotated = bool(self.events_cfg["save_annotated_frame"])
         self.events_once_per_streak = bool(self.events_cfg["once_per_streak"])
@@ -6315,8 +6962,17 @@ class InferenceWindow(QMainWindow):
         if self.current_model_path is not None and self.current_model_path.exists():
             self.model_cfg["selected_model_path"] = _to_relative_or_abs(self.current_model_path)
 
-    def _persist_config(self, *, show_message: bool) -> None:
-        self._apply_controls_to_runtime_state()
+    def _persist_config(
+        self,
+        *,
+        show_message: bool,
+        previous_settings: dict[str, dict[str, Any]] | None = None,
+    ) -> None:
+        if previous_settings is None:
+            previous_settings = self._snapshot_settings_state()
+            self._apply_controls_to_runtime_state()
+        current_settings = self._snapshot_settings_state()
+        setting_changes = self._collect_setting_changes(previous_settings, current_settings)
 
         self.config["model"] = dict(self.model_cfg)
         self.config["inference"] = dict(self.inference_cfg)
@@ -6326,12 +6982,26 @@ class InferenceWindow(QMainWindow):
         self.config["runtime"] = dict(self.runtime_cfg)
         self.config.pop("sources", None)
 
+        config_signature = json.dumps(self.config, sort_keys=True, ensure_ascii=True, default=str)
+        config_changed = config_signature != self._last_saved_config_signature
+
         self.app_settings_dir.mkdir(parents=True, exist_ok=True)
         save_yaml(self.app_config_path, self.config)
         try:
             self._save_sources_config()
         except Exception as exc:  # noqa: BLE001
             self._log(f"[warn] Unable to save sources config: {exc}")
+
+        self._last_saved_config_signature = config_signature
+        if config_changed:
+            self._log(
+                "Config changed and saved: "
+                f"{self.app_config_path} (sources: {self.sources_settings_path})"
+            )
+            if setting_changes:
+                self._log("Settings changes:")
+                for change in setting_changes:
+                    self._log(f"  - {change}")
 
         if show_message:
             QMessageBox.information(
