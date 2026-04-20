@@ -1327,7 +1327,12 @@ class InferenceWindow(QMainWindow):
         return (
             "autobackend does not support len()" in normalized
             or "does not support len()" in normalized
+            or "backendcompilerfailed" in normalized
+            or "torch.utils._sympy" in normalized
+            or "pow_by_natural" in normalized
+            or "failed while executing" in normalized
             or "torch._inductor" in normalized
+            or "inductor" in normalized
             or "triton" in normalized
         )
 
@@ -4169,10 +4174,18 @@ class InferenceWindow(QMainWindow):
             source["ignore_polys"] = new_poly
         source.pop("ignore_poly", None)
         source.pop("ignore_rect", None)
+
+        # Keep runtime source in sync so live inference uses the new mask immediately.
+        runtime.source = dict(source)
         self._ignore_mask_cache.pop(source_name, None)
         self._rebuild_source_lookup()
+
+        if self.live_running and runtime.last_input is not None:
+            self._enqueue_inference_frame(source_name, runtime.last_input, time.perf_counter())
+
         self._persist_config(show_message=False)
         self._rebuild_source_table()
+        self._refresh_tile(source_name)
 
     def _remove_selected_source(self) -> None:
         row = self.source_table.currentRow()
@@ -5367,20 +5380,14 @@ class InferenceWindow(QMainWindow):
                 if not self.compile_enabled:
                     raise
 
-                message = str(exc)
-                compile_related = (
-                    "AutoBackend does not support len()" in message
-                    or "torch._inductor" in message
-                    or "triton" in message.lower()
-                )
-                if not compile_related:
+                if not self._is_compile_runtime_error(exc):
                     raise
 
                 if not self.compile_fallback_applied:
                     self.compile_fallback_applied = True
                     self._queue_async_notice(
                         "compile failed for inference, fallback to compile=False "
-                        f"({exc.__class__.__name__}: {message})"
+                        f"({exc.__class__.__name__}: {exc})"
                     )
 
                 self.compile_enabled = False
