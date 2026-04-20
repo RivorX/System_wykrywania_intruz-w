@@ -15,6 +15,16 @@ model:
   use_fallback: false
   force_redownload: false
   selected_model_path: models\base\yolo26s.pt
+  day_segmentation:
+    enabled: true
+    name: yolo26s-seg.pt
+    local_weights_dir: models/base
+    auto_download: true
+    download_url: null
+    fallback_name: null
+    use_fallback: false
+    force_redownload: false
+    selected_model_path: models\base\yolo26s-seg.pt
 
 # === INFERENCE ===
 # ------------------------------------------------------------
@@ -51,6 +61,15 @@ security:
   night_end_hour: 6
   day_person_threshold: 1
   night_person_threshold: 1
+
+# === UNIFORM ===
+# ------------------------------------------------------------
+uniform:
+  enabled: true
+  top_color: "#2F5FA8"
+  bottom_color: "#1F2430"
+  color_tolerance: 42.0
+  min_mask_pixels: 180
 
 # === EVENTS ===
 # ------------------------------------------------------------

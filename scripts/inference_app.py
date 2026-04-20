@@ -32,6 +32,7 @@ from PyQt6.QtWidgets import (
     QApplication,
     QAbstractItemView,
     QCheckBox,
+    QColorDialog,
     QComboBox,
     QDateEdit,
     QDoubleSpinBox,
@@ -77,10 +78,100 @@ from utils.runtime_env_utils import ensure_windows_compile_env
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-TrackedBox = tuple[int, int, int, int, float, int | None]
 EVENT_IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".bmp"}
 EVENT_VIDEO_SUFFIXES = {".mp4", ".avi", ".mkv", ".mov", ".wmv", ".m4v"}
 QIMAGE_BGR888 = getattr(QImage.Format, "Format_BGR888", None)
+DEFAULT_DAY_SEG_MODEL_NAME = "yolo26s-seg.pt"
+DAY_SEG_MODEL_SUGGESTIONS = ["yolo26n-seg.pt", "yolo26s-seg.pt", "yolo26m-seg.pt"]
+UNIFORM_TOP_DEFAULT = "#2F5FA8"
+UNIFORM_BOTTOM_DEFAULT = "#1F2430"
+UNIFORM_COLOR_TOLERANCE_DEFAULT = 42.0
+UNIFORM_MIN_MASK_PIXELS_DEFAULT = 180
+
+
+@dataclass
+class PersonDetection:
+    x1: int
+    y1: int
+    x2: int
+    y2: int
+    conf: float
+    track_id: int | None = None
+    is_intruder: bool = False
+    uniform_match: bool | None = None
+    upper_match: bool | None = None
+    lower_match: bool | None = None
+    upper_color_hex: str = ""
+    lower_color_hex: str = ""
+    has_segmentation: bool = False
+    label: str = ""
+
+
+def _normalize_hex_color(value: Any, fallback: str) -> str:
+    raw = str(value or "").strip().lstrip("#")
+    if len(raw) != 6:
+        return fallback.upper()
+    try:
+        int(raw, 16)
+    except Exception:  # noqa: BLE001
+        return fallback.upper()
+    return f"#{raw.upper()}"
+
+
+def _hex_to_bgr(value: str) -> tuple[int, int, int]:
+    normalized = _normalize_hex_color(value, "#000000")
+    red = int(normalized[1:3], 16)
+    green = int(normalized[3:5], 16)
+    blue = int(normalized[5:7], 16)
+    return blue, green, red
+
+
+def _bgr_to_hex(color: tuple[int, int, int] | np.ndarray) -> str:
+    blue, green, red = [int(max(0, min(255, channel))) for channel in color]
+    return f"#{red:02X}{green:02X}{blue:02X}"
+
+
+def _lab_color_distance(color_a: tuple[int, int, int], color_b: tuple[int, int, int]) -> float:
+    sample = np.array([[list(color_a), list(color_b)]], dtype=np.uint8)
+    lab = cv2.cvtColor(sample, cv2.COLOR_BGR2LAB)
+    first = lab[0, 0].astype(np.float32)
+    second = lab[0, 1].astype(np.float32)
+    return float(np.linalg.norm(first - second))
+
+
+def _compute_region_color(frame: np.ndarray, mask: np.ndarray, y_start: int, y_end: int) -> tuple[str, int] | None:
+    if frame.ndim != 3 or mask.ndim != 2:
+        return None
+    height = frame.shape[0]
+    y1 = max(0, min(height, int(y_start)))
+    y2 = max(y1, min(height, int(y_end)))
+    if y2 <= y1:
+        return None
+    region_mask = mask[y1:y2, :] > 0
+    if not np.any(region_mask):
+        return None
+    region_pixels = frame[y1:y2, :, :][region_mask]
+    if region_pixels.size == 0:
+        return None
+    median_color = np.median(region_pixels, axis=0)
+    color = tuple(int(max(0, min(255, round(float(channel))))) for channel in median_color)
+    return _bgr_to_hex(color), int(region_pixels.shape[0])
+
+
+def _build_day_segmentation_cfg(model_cfg: dict[str, Any]) -> dict[str, Any]:
+    base_dir = str(model_cfg.get("local_weights_dir", "models/base"))
+    raw_cfg = model_cfg.get("day_segmentation", {}) or {}
+    seg_cfg = dict(raw_cfg) if isinstance(raw_cfg, dict) else {}
+    seg_cfg.setdefault("enabled", True)
+    seg_cfg.setdefault("name", DEFAULT_DAY_SEG_MODEL_NAME)
+    seg_cfg.setdefault("local_weights_dir", base_dir)
+    seg_cfg.setdefault("auto_download", bool(model_cfg.get("auto_download", True)))
+    seg_cfg.setdefault("fallback_name", None)
+    seg_cfg.setdefault("use_fallback", False)
+    seg_cfg.setdefault("force_redownload", False)
+    seg_cfg.setdefault("download_url", None)
+    seg_cfg.setdefault("selected_model_path", "")
+    return seg_cfg
 
 YOLO_PROFILE_PRESETS: dict[str, dict[str, Any]] = {
     "low": {
@@ -404,9 +495,10 @@ class SourceRuntime:
     last_meta_fps_update_ts: float = 0.0
     last_render_ts: float = 0.0
     person_count: int = 0
+    intruder_count: int = 0
     alert: bool = False
     mode: str = "day"
-    last_boxes: list[TrackedBox] | None = None
+    last_boxes: list[PersonDetection] | None = None
     last_input: np.ndarray | None = None
     last_output: np.ndarray | None = None
     capture_reader_thread: threading.Thread | None = None
@@ -473,9 +565,10 @@ class SourceRuntime:
 class AsyncInferenceResult:
     infer_ts: float
     person_count: int
+    intruder_count: int
     mode: str
     alert: bool
-    boxes: list[TrackedBox]
+    boxes: list[PersonDetection]
 
 
 class VideoCanvas(QLabel):
@@ -895,6 +988,78 @@ class MaskEditorWidget(QWidget):
         self.update()
 
 
+class UniformPreviewWidget(QWidget):
+    def __init__(self) -> None:
+        super().__init__()
+        self._top_color = QColor(UNIFORM_TOP_DEFAULT)
+        self._bottom_color = QColor(UNIFORM_BOTTOM_DEFAULT)
+        self.setMinimumSize(150, 220)
+
+    def set_colors(self, top_hex: str, bottom_hex: str) -> None:
+        self._top_color = QColor(_normalize_hex_color(top_hex, UNIFORM_TOP_DEFAULT))
+        self._bottom_color = QColor(_normalize_hex_color(bottom_hex, UNIFORM_BOTTOM_DEFAULT))
+        self.update()
+
+    def paintEvent(self, event: Any) -> None:  # noqa: ANN401
+        super().paintEvent(event)
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+
+        rect = self.rect().adjusted(12, 12, -12, -12)
+        painter.fillRect(rect, QColor("#121822"))
+        painter.setPen(QPen(QColor("#344153"), 2))
+        painter.drawRoundedRect(rect, 14, 14)
+
+        center_x = rect.center().x()
+        top_y = rect.top() + 18
+        head_radius = max(14, rect.width() // 10)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor("#f1d3bd"))
+        painter.drawEllipse(QPointF(center_x, top_y + head_radius), head_radius, head_radius)
+
+        torso_top = top_y + head_radius * 2 + 10
+        torso_width = max(34, rect.width() // 3)
+        torso_height = max(56, rect.height() // 3)
+        torso_rect = QRectF(center_x - torso_width / 2, torso_top, torso_width, torso_height)
+        painter.setBrush(self._top_color)
+        painter.drawRoundedRect(torso_rect, 12, 12)
+
+        arm_width = max(10, torso_width // 4)
+        arm_height = max(48, torso_height - 10)
+        painter.drawRoundedRect(QRectF(torso_rect.left() - arm_width + 4, torso_rect.top() + 8, arm_width, arm_height), 8, 8)
+        painter.drawRoundedRect(QRectF(torso_rect.right() - 4, torso_rect.top() + 8, arm_width, arm_height), 8, 8)
+
+        waist_y = torso_rect.bottom() - 4
+        leg_gap = max(8, torso_width // 7)
+        leg_width = max(14, torso_width // 3)
+        leg_height = max(64, rect.bottom() - waist_y - 26)
+        painter.setBrush(self._bottom_color)
+        painter.drawRoundedRect(
+            QRectF(center_x - leg_gap / 2 - leg_width, waist_y, leg_width, leg_height),
+            9,
+            9,
+        )
+        painter.drawRoundedRect(
+            QRectF(center_x + leg_gap / 2, waist_y, leg_width, leg_height),
+            9,
+            9,
+        )
+
+        shoe_width = max(18, leg_width + 6)
+        shoe_height = 10
+        painter.setBrush(QColor("#d8dde8"))
+        painter.drawRoundedRect(
+            QRectF(center_x - leg_gap / 2 - shoe_width, waist_y + leg_height - 4, shoe_width, shoe_height),
+            5,
+            5,
+        )
+        painter.drawRoundedRect(
+            QRectF(center_x + leg_gap / 2 - 2, waist_y + leg_height - 4, shoe_width, shoe_height),
+            5,
+            5,
+        )
+
+
 class MaskEditorDialog(QDialog):
     def __init__(
         self,
@@ -1040,6 +1205,7 @@ class InferenceWindow(QMainWindow):
         self.model_cfg = dict(self.config.get("model", {}) or {})
         self.inference_cfg = dict(self.config.get("inference", {}) or {})
         self.security_cfg = dict(self.config.get("security", {}) or {})
+        self.uniform_cfg = dict(self.config.get("uniform", {}) or {})
         self.runtime_cfg = dict(self.config.get("runtime", {}) or {})
         self.tracker_cfg = dict(self.config.get("tracker", {}) or {})
         self.events_cfg = dict(self.config.get("events", {}) or {})
@@ -1060,7 +1226,11 @@ class InferenceWindow(QMainWindow):
         self.model: YOLO | None = None
         self.model_reference = ""
         self.current_model_path: Path | None = None
+        self.day_seg_model: YOLO | None = None
+        self.day_seg_model_reference = ""
+        self.current_day_seg_model_path: Path | None = None
         self.predict_kwargs: dict[str, Any] = {}
+        self.day_seg_predict_kwargs: dict[str, Any] = {}
         self.compile_requested = False
         self.compile_enabled = False
         self.compile_fallback_applied = False
@@ -1240,8 +1410,8 @@ class InferenceWindow(QMainWindow):
         self.start_live()
 
     # ---------- model ----------
-    def _resolve_canonical_trained_model_path(self) -> Path | None:
-        model_name = str(self.model_cfg.get("name", "")).strip()
+    def _resolve_canonical_trained_model_path(self, model_cfg: dict[str, Any]) -> Path | None:
+        model_name = str(model_cfg.get("name", "")).strip()
         if not model_name:
             return None
         if not model_name.lower().endswith(".pt"):
@@ -1251,8 +1421,8 @@ class InferenceWindow(QMainWindow):
             return candidate.resolve()
         return None
 
-    def _resolve_trained_weights_path(self) -> Path | None:
-        trained_cfg = self.model_cfg.get("trained_weights", {}) or {}
+    def _resolve_trained_weights_path(self, model_cfg: dict[str, Any]) -> Path | None:
+        trained_cfg = model_cfg.get("trained_weights", {}) or {}
         if not bool(trained_cfg.get("enabled", False)):
             return None
 
@@ -1266,34 +1436,37 @@ class InferenceWindow(QMainWindow):
                 return candidate
         return None
 
-    def _resolve_model_reference(self) -> tuple[YOLO, str, Path | None]:
-        selected_model_path = str(self.model_cfg.get("selected_model_path", "")).strip()
+    def _resolve_model_reference_for_cfg(self, model_cfg: dict[str, Any]) -> tuple[YOLO, str, Path | None]:
+        selected_model_path = str(model_cfg.get("selected_model_path", "")).strip()
         if selected_model_path:
             selected_path = resolve_path(selected_model_path)
             if selected_path.exists():
                 return YOLO(str(selected_path)), str(selected_path), selected_path
 
-        trained_cfg = self.model_cfg.get("trained_weights", {}) or {}
+        trained_cfg = model_cfg.get("trained_weights", {}) or {}
         prefer_canonical = bool(trained_cfg.get("prefer_canonical", True))
         if prefer_canonical:
-            canonical_trained_path = self._resolve_canonical_trained_model_path()
+            canonical_trained_path = self._resolve_canonical_trained_model_path(model_cfg)
             if canonical_trained_path is not None:
                 return YOLO(str(canonical_trained_path)), str(canonical_trained_path), canonical_trained_path
 
-        trained_path = self._resolve_trained_weights_path()
+        trained_path = self._resolve_trained_weights_path(model_cfg)
         fallback_to_base = bool(trained_cfg.get("fallback_to_base", True))
 
         if trained_path is not None:
             return YOLO(str(trained_path)), str(trained_path), trained_path
 
         if fallback_to_base:
-            model, reference = load_yolo_model(self.model_cfg)
+            model, reference = load_yolo_model(model_cfg)
             reference_path = Path(reference).resolve() if Path(reference).exists() else None
             return model, reference, reference_path
 
         raise FileNotFoundError(
             "No model available. Set model.selected_model_path or keep trained_weights fallback enabled."
         )
+
+    def _resolve_model_reference(self) -> tuple[YOLO, str, Path | None]:
+        return self._resolve_model_reference_for_cfg(self.model_cfg)
 
     def _rebuild_predict_kwargs(self) -> None:
         self.predict_kwargs = {
@@ -1320,6 +1493,40 @@ class InferenceWindow(QMainWindow):
             self.predict_kwargs["compile"] = True
         else:
             self.predict_kwargs.pop("compile", None)
+
+        self.day_seg_predict_kwargs = dict(self.predict_kwargs)
+        self.day_seg_predict_kwargs.pop("compile", None)
+
+    def _uniform_detection_enabled(self) -> bool:
+        return bool(self.uniform_cfg.get("enabled", True))
+
+    def _day_segmentation_model_cfg(self) -> dict[str, Any]:
+        return _build_day_segmentation_cfg(self.model_cfg)
+
+    def _load_optional_day_segmentation_model(self) -> None:
+        self.day_seg_model = None
+        self.day_seg_model_reference = ""
+        self.current_day_seg_model_path = None
+
+        if not self._uniform_detection_enabled():
+            return
+
+        seg_cfg = self._day_segmentation_model_cfg()
+        if not bool(seg_cfg.get("enabled", True)):
+            return
+
+        try:
+            model, reference, reference_path = self._resolve_model_reference_for_cfg(seg_cfg)
+        except Exception as exc:  # noqa: BLE001
+            self._log(f"[warn] Nie udalo sie zaladowac modelu segmentacji dziennej: {exc}")
+            return
+
+        self.day_seg_model = model
+        self.day_seg_model_reference = reference
+        self.current_day_seg_model_path = reference_path
+        self.model_cfg["day_segmentation"] = dict(seg_cfg)
+        if reference_path is not None and reference_path.exists():
+            self.model_cfg["day_segmentation"]["selected_model_path"] = _to_relative_or_abs(reference_path)
 
     def _is_compile_runtime_error(self, exc: Exception) -> bool:
         message = str(exc)
@@ -1351,6 +1558,7 @@ class InferenceWindow(QMainWindow):
             "inference": dict(self.inference_cfg),
             "tracker": dict(self.tracker_cfg),
             "security": dict(self.security_cfg),
+            "uniform": dict(self.uniform_cfg),
             "events": dict(self.events_cfg),
             "runtime": dict(self.runtime_cfg),
         }
@@ -1398,7 +1606,8 @@ class InferenceWindow(QMainWindow):
             f"imgsz={self.predict_kwargs.get('imgsz')} max_det={self.predict_kwargs.get('max_det')} "
             f"device={self.predict_kwargs.get('device', 'auto')} half={self.predict_kwargs.get('half', False)} "
             f"classes={classes_text} | "
-            f"compile_requested={self.compile_requested} compile_status={self._compile_status_text()}"
+            f"compile_requested={self.compile_requested} compile_status={self._compile_status_text()} | "
+            f"day_seg={self.day_seg_model_reference or '-'}"
         )
 
     def _preflight_compile_predict(self) -> None:
@@ -1489,9 +1698,12 @@ class InferenceWindow(QMainWindow):
         self.manual_compile_active = False
 
         self._rebuild_predict_kwargs()
+        self._load_optional_day_segmentation_model()
         if self.compile_enabled and not self._try_manual_backend_compile():
             self._preflight_compile_predict()
         self._log(f"Model loaded: {reference}")
+        if self.day_seg_model is not None:
+            self._log(f"Day segmentation model loaded: {self.day_seg_model_reference}")
         self._log_active_model_runtime(reason="load")
 
     # ---------- UI ----------
@@ -1818,7 +2030,7 @@ class InferenceWindow(QMainWindow):
         security_grid.addWidget(self.night_start_spin, 1, 1)
         security_grid.addWidget(QLabel("Noc do (godzina):"), 2, 0)
         security_grid.addWidget(self.night_end_spin, 2, 1)
-        security_grid.addWidget(QLabel("Ilosc osob do uruchomienia alarmu w dzien:"), 3, 0)
+        security_grid.addWidget(QLabel("Ilosc intruzow do uruchomienia alarmu w dzien:"), 3, 0)
         security_grid.addWidget(self.day_threshold_spin, 3, 1)
         security_grid.addWidget(QLabel("Ilosc osob do uruchomienia alarmu w nocy:"), 4, 0)
         security_grid.addWidget(self.night_threshold_spin, 4, 1)
@@ -1838,6 +2050,8 @@ class InferenceWindow(QMainWindow):
 
         self.yolo_model_combo = QComboBox()
         self.yolo_model_combo.setMaxVisibleItems(20)
+        self.yolo_day_seg_model_combo = QComboBox()
+        self.yolo_day_seg_model_combo.setMaxVisibleItems(20)
 
         self.model_target_fps_spin = QSpinBox()
         self.model_target_fps_spin.setRange(1, 60)
@@ -1880,17 +2094,19 @@ class InferenceWindow(QMainWindow):
         inference_left_grid.setVerticalSpacing(8)
         inference_left_grid.addWidget(QLabel("Preset:"), 0, 0)
         inference_left_grid.addWidget(self.yolo_profile_combo, 0, 1)
-        inference_left_grid.addWidget(QLabel("Model YOLO:"), 1, 0)
+        inference_left_grid.addWidget(QLabel("Model YOLO (noc):"), 1, 0)
         inference_left_grid.addWidget(self.yolo_model_combo, 1, 1)
-        inference_left_grid.addWidget(QLabel("FPS modelu:"), 2, 0)
-        inference_left_grid.addWidget(self.model_target_fps_spin, 2, 1)
-        inference_left_grid.addWidget(QLabel("Urzadzenie:"), 3, 0)
-        inference_left_grid.addWidget(self.device_edit, 3, 1)
-        inference_left_grid.addWidget(self.yolo_profile_help_label, 4, 0, 1, 2)
-        inference_left_grid.addWidget(self.yolo_profile_summary_label, 5, 0, 1, 2)
-        inference_left_grid.addWidget(half_row, 6, 0, 1, 2)
-        inference_left_grid.addWidget(compile_row, 7, 0, 1, 2)
-        inference_left_grid.addWidget(startmax_row, 8, 0, 1, 2)
+        inference_left_grid.addWidget(QLabel("Model YOLO (dzien):"), 2, 0)
+        inference_left_grid.addWidget(self.yolo_day_seg_model_combo, 2, 1)
+        inference_left_grid.addWidget(QLabel("FPS modelu:"), 3, 0)
+        inference_left_grid.addWidget(self.model_target_fps_spin, 3, 1)
+        inference_left_grid.addWidget(QLabel("Urzadzenie:"), 4, 0)
+        inference_left_grid.addWidget(self.device_edit, 4, 1)
+        inference_left_grid.addWidget(self.yolo_profile_help_label, 5, 0, 1, 2)
+        inference_left_grid.addWidget(self.yolo_profile_summary_label, 6, 0, 1, 2)
+        inference_left_grid.addWidget(half_row, 7, 0, 1, 2)
+        inference_left_grid.addWidget(compile_row, 8, 0, 1, 2)
+        inference_left_grid.addWidget(startmax_row, 9, 0, 1, 2)
 
         inference_right_widget = QWidget()
         inference_right_grid = QGridLayout(inference_right_widget)
@@ -1982,6 +2198,70 @@ class InferenceWindow(QMainWindow):
         top_settings_row.addWidget(events_box, stretch=1)
         layout.addLayout(top_settings_row)
         layout.addWidget(inference_box)
+
+        uniform_box = QGroupBox("Wzorzec ubioru dziennego")
+        uniform_box.setStyleSheet(settings_box_style)
+        uniform_layout = QHBoxLayout(uniform_box)
+        uniform_layout.setContentsMargins(12, 12, 12, 12)
+        uniform_layout.setSpacing(18)
+
+        uniform_left_widget = QWidget()
+        uniform_left_grid = QGridLayout(uniform_left_widget)
+        uniform_left_grid.setContentsMargins(0, 0, 0, 0)
+        uniform_left_grid.setHorizontalSpacing(10)
+        uniform_left_grid.setVerticalSpacing(8)
+
+        uniform_enabled_row, self.uniform_enabled_checkbox = _make_toggle_row(
+            "W dzien wykrywaj intruza po niezgodnym ubiorze"
+        )
+
+        self.uniform_tolerance_spin = QDoubleSpinBox()
+        self.uniform_tolerance_spin.setRange(5.0, 120.0)
+        self.uniform_tolerance_spin.setSingleStep(1.0)
+        self.uniform_tolerance_spin.setDecimals(1)
+
+        self.uniform_min_pixels_spin = QSpinBox()
+        self.uniform_min_pixels_spin.setRange(20, 50000)
+        self.uniform_min_pixels_spin.setSingleStep(20)
+
+        self.uniform_top_color_btn = QPushButton()
+        self.uniform_top_color_btn.clicked.connect(lambda: self._choose_uniform_color("top"))
+        self.uniform_bottom_color_btn = QPushButton()
+        self.uniform_bottom_color_btn.clicked.connect(lambda: self._choose_uniform_color("bottom"))
+
+        self.uniform_help_label = QLabel(
+            "W trybie dziennym aplikacja uzywa modelu segmentacji osoby, "
+            "wycina sylwetke maska i porownuje kolor gornej oraz dolnej czesci ubioru z wzorcem."
+        )
+        self.uniform_help_label.setWordWrap(True)
+        self.uniform_help_label.setStyleSheet("color: #9fb0c9;")
+
+        uniform_left_grid.addWidget(uniform_enabled_row, 0, 0, 1, 2)
+        uniform_left_grid.addWidget(QLabel("Kolor gornej czesci:"), 1, 0)
+        uniform_left_grid.addWidget(self.uniform_top_color_btn, 1, 1)
+        uniform_left_grid.addWidget(QLabel("Kolor dolnej czesci:"), 2, 0)
+        uniform_left_grid.addWidget(self.uniform_bottom_color_btn, 2, 1)
+        uniform_left_grid.addWidget(QLabel("Tolerancja koloru (LAB):"), 3, 0)
+        uniform_left_grid.addWidget(self.uniform_tolerance_spin, 3, 1)
+        uniform_left_grid.addWidget(QLabel("Min. pikseli maski na sekcje:"), 4, 0)
+        uniform_left_grid.addWidget(self.uniform_min_pixels_spin, 4, 1)
+        uniform_left_grid.addWidget(self.uniform_help_label, 5, 0, 1, 2)
+
+        uniform_right_widget = QWidget()
+        uniform_right_layout = QVBoxLayout(uniform_right_widget)
+        uniform_right_layout.setContentsMargins(0, 0, 0, 0)
+        uniform_right_layout.setSpacing(8)
+        self.uniform_preview_widget = UniformPreviewWidget()
+        self.uniform_preview_title = QLabel("Podglad zaprogramowanego stroju")
+        self.uniform_preview_title.setAlignment(Qt.AlignmentFlag.AlignHCenter)
+        self.uniform_preview_title.setStyleSheet("color: #d8d8d8; font-weight: 600;")
+        uniform_right_layout.addWidget(self.uniform_preview_title)
+        uniform_right_layout.addWidget(self.uniform_preview_widget, alignment=Qt.AlignmentFlag.AlignHCenter)
+        uniform_right_layout.addStretch(1)
+
+        uniform_layout.addWidget(uniform_left_widget, stretch=12)
+        uniform_layout.addWidget(uniform_right_widget, stretch=7)
+        layout.addWidget(uniform_box)
 
         model_box = QGroupBox("Zaawansowany wybor modelu")
         model_box.setStyleSheet(settings_box_style)
@@ -2607,6 +2887,11 @@ class InferenceWindow(QMainWindow):
             "selected_model_path": selected_model_path,
         }
 
+    def _entry_is_segmentation_model(self, entry: dict[str, Any]) -> bool:
+        model_name = str(entry.get("model_name", entry.get("name", ""))).strip().lower()
+        task_name = str(entry.get("task", "")).strip().lower()
+        return model_name.endswith("-seg.pt") or task_name in {"segment", "seg"}
+
     def _current_yolo_model_selection(self) -> dict[str, str]:
         data_value = self.yolo_model_combo.currentData()
         if isinstance(data_value, dict):
@@ -2619,6 +2904,20 @@ class InferenceWindow(QMainWindow):
             "selected_model_path": str(self.model_cfg.get("selected_model_path", "")).strip(),
         }
 
+    def _current_day_seg_model_selection(self) -> dict[str, str]:
+        seg_cfg = self._day_segmentation_model_cfg()
+        if hasattr(self, "yolo_day_seg_model_combo") and self.yolo_day_seg_model_combo is not None:
+            data_value = self.yolo_day_seg_model_combo.currentData()
+            if isinstance(data_value, dict):
+                return {
+                    "model_name": str(data_value.get("model_name", "")).strip(),
+                    "selected_model_path": str(data_value.get("selected_model_path", "")).strip(),
+                }
+        return {
+            "model_name": str(seg_cfg.get("name", DEFAULT_DAY_SEG_MODEL_NAME)).strip(),
+            "selected_model_path": str(seg_cfg.get("selected_model_path", "")).strip(),
+        }
+
     def _populate_yolo_model_combo(self) -> None:
         if not hasattr(self, "yolo_model_combo") or self.yolo_model_combo is None:
             return
@@ -2627,7 +2926,11 @@ class InferenceWindow(QMainWindow):
         combo_model = self.yolo_model_combo.model()
         self.yolo_model_combo.clear()
 
-        installed_entries = [entry for entry in self.model_catalog if not bool(entry.get("missing", False))]
+        installed_entries = [
+            entry
+            for entry in self.model_catalog
+            if not bool(entry.get("missing", False)) and not self._entry_is_segmentation_model(entry)
+        ]
         recommended_entries: list[dict[str, Any]] = []
         older_entries: list[dict[str, Any]] = []
         for entry in installed_entries:
@@ -2663,6 +2966,49 @@ class InferenceWindow(QMainWindow):
             fallback_selection = self._build_model_selection(installed_entries[0])
         self._set_model_combo_value(fallback_selection)
 
+    def _populate_day_seg_model_combo(self) -> None:
+        if not hasattr(self, "yolo_day_seg_model_combo") or self.yolo_day_seg_model_combo is None:
+            return
+
+        current_selection = self._current_day_seg_model_selection()
+        combo_model = self.yolo_day_seg_model_combo.model()
+        self.yolo_day_seg_model_combo.clear()
+
+        installed_seg_entries = [
+            entry
+            for entry in self.model_catalog
+            if self._entry_is_segmentation_model(entry) and not bool(entry.get("missing", False))
+        ]
+        installed_seg_entries.sort(key=self._model_catalog_sort_key)
+
+        if installed_seg_entries:
+            self.yolo_day_seg_model_combo.addItem("Segmentacja - zainstalowane")
+            header_index = self.yolo_day_seg_model_combo.count() - 1
+            if hasattr(combo_model, "item"):
+                header_item = combo_model.item(header_index)
+                if isinstance(header_item, QStandardItem):
+                    header_item.setEnabled(False)
+                    header_item.setSelectable(False)
+                    header_item.setForeground(QColor("#7d889a"))
+            for entry in installed_seg_entries:
+                label = f"{entry.get('display_name', entry.get('name', '-'))} [{entry.get('kind', 'custom')}]"
+                self.yolo_day_seg_model_combo.addItem(label, self._build_model_selection(entry))
+        else:
+            self.yolo_day_seg_model_combo.addItem("Brak lokalnych modeli segm - pobierz z tabeli na dole")
+            header_index = self.yolo_day_seg_model_combo.count() - 1
+            if hasattr(combo_model, "item"):
+                header_item = combo_model.item(header_index)
+                if isinstance(header_item, QStandardItem):
+                    header_item.setEnabled(False)
+                    header_item.setSelectable(False)
+                    header_item.setForeground(QColor("#7d889a"))
+
+        fallback_selection = current_selection
+        first_available = installed_seg_entries[0] if installed_seg_entries else None
+        if not fallback_selection["model_name"] and first_available is not None:
+            fallback_selection = self._build_model_selection(first_available)
+        self._set_day_seg_model_combo_value(fallback_selection)
+
     def _set_model_combo_value(self, selection: dict[str, str] | str) -> None:
         if isinstance(selection, str):
             target_model_name = str(selection).strip()
@@ -2687,6 +3033,34 @@ class InferenceWindow(QMainWindow):
         for index in range(self.yolo_model_combo.count()):
             if isinstance(self.yolo_model_combo.itemData(index), dict):
                 self.yolo_model_combo.setCurrentIndex(index)
+                return
+
+    def _set_day_seg_model_combo_value(self, selection: dict[str, str] | str) -> None:
+        if not hasattr(self, "yolo_day_seg_model_combo") or self.yolo_day_seg_model_combo is None:
+            return
+        if isinstance(selection, str):
+            target_model_name = str(selection).strip()
+            target_path = ""
+        else:
+            target_model_name = str(selection.get("model_name", "")).strip()
+            target_path = str(selection.get("selected_model_path", "")).strip()
+
+        for index in range(self.yolo_day_seg_model_combo.count()):
+            data_value = self.yolo_day_seg_model_combo.itemData(index)
+            if not isinstance(data_value, dict):
+                continue
+            candidate_model_name = str(data_value.get("model_name", "")).strip()
+            candidate_path = str(data_value.get("selected_model_path", "")).strip()
+            if target_path and candidate_path == target_path:
+                self.yolo_day_seg_model_combo.setCurrentIndex(index)
+                return
+            if candidate_model_name == target_model_name and (not target_path or candidate_path == target_path):
+                self.yolo_day_seg_model_combo.setCurrentIndex(index)
+                return
+
+        for index in range(self.yolo_day_seg_model_combo.count()):
+            if isinstance(self.yolo_day_seg_model_combo.itemData(index), dict):
+                self.yolo_day_seg_model_combo.setCurrentIndex(index)
                 return
 
     def _set_imgsz_combo_value(self, imgsz_value: int) -> None:
@@ -2751,12 +3125,81 @@ class InferenceWindow(QMainWindow):
                 f"{preset['title']}: {preset['description']} Domyslny model: {preset['model_name']}."
             )
         current_model_name = self._current_yolo_model_selection()["model_name"]
+        day_seg_model_name = self._current_day_seg_model_selection()["model_name"]
         self.yolo_profile_summary_label.setText(
             "Aplikacja ustawi: "
             f"model={current_model_name} | conf={self.conf_spin.value():.2f} | "
             f"IOU={self.iou_spin.value():.2f} | imgsz={self._current_imgsz_value()} | "
-            f"max_det={int(self.max_det_spin.value())} | fps_modelu={int(self.model_target_fps_spin.value())}"
+            f"max_det={int(self.max_det_spin.value())} | fps_modelu={int(self.model_target_fps_spin.value())} | "
+            f"seg_dzien={day_seg_model_name or '-'}"
         )
+
+    def _update_uniform_color_button(self, button: QPushButton, color_hex: str, label: str) -> None:
+        normalized = _normalize_hex_color(color_hex, UNIFORM_TOP_DEFAULT)
+        rgb = QColor(normalized)
+        brightness = (rgb.red() * 299 + rgb.green() * 587 + rgb.blue() * 114) / 1000.0
+        text_color = "#0E1117" if brightness >= 150 else "#F7FAFF"
+        button.setText(f"{label}: {normalized}")
+        button.setStyleSheet(
+            "QPushButton {"
+            f"background: {normalized};"
+            f"color: {text_color};"
+            "font-weight: 700;"
+            "border: 1px solid #3b4657;"
+            "border-radius: 6px;"
+            "padding: 6px 10px;"
+            "}"
+        )
+
+    def _sync_uniform_preview(self) -> None:
+        top_hex = str(getattr(self, "_selected_uniform_top_color", self.uniform_cfg.get("top_color", UNIFORM_TOP_DEFAULT)))
+        bottom_hex = str(
+            getattr(self, "_selected_uniform_bottom_color", self.uniform_cfg.get("bottom_color", UNIFORM_BOTTOM_DEFAULT))
+        )
+        self._update_uniform_color_button(self.uniform_top_color_btn, top_hex, "Gora")
+        self._update_uniform_color_button(self.uniform_bottom_color_btn, bottom_hex, "Dol")
+        self.uniform_preview_widget.set_colors(top_hex, bottom_hex)
+
+    def _update_uniform_controls_enabled(self) -> None:
+        enabled = bool(self.uniform_enabled_checkbox.isChecked())
+        for widget in (
+            self.yolo_day_seg_model_combo,
+            self.uniform_top_color_btn,
+            self.uniform_bottom_color_btn,
+            self.uniform_tolerance_spin,
+            self.uniform_min_pixels_spin,
+            self.uniform_preview_widget,
+        ):
+            widget.setEnabled(enabled)
+
+    def _choose_uniform_color(self, section: str) -> None:
+        current_value = (
+            getattr(self, "_selected_uniform_top_color", self.uniform_cfg.get("top_color", UNIFORM_TOP_DEFAULT))
+            if section == "top"
+            else getattr(self, "_selected_uniform_bottom_color", self.uniform_cfg.get("bottom_color", UNIFORM_BOTTOM_DEFAULT))
+        )
+        picked = QColorDialog.getColor(QColor(_normalize_hex_color(current_value, UNIFORM_TOP_DEFAULT)), self, "Wybierz kolor ubioru")
+        if not picked.isValid():
+            return
+        normalized = picked.name(QColor.NameFormat.HexRgb).upper()
+        if section == "top":
+            self._selected_uniform_top_color = normalized
+        else:
+            self._selected_uniform_bottom_color = normalized
+        self._sync_uniform_preview()
+        self._on_setting_changed()
+
+    def _on_day_seg_manual_control_changed(self, *_args: Any) -> None:
+        if self._suppress_setting_autosave:
+            return
+        self._update_yolo_profile_summary()
+        self._on_setting_changed()
+
+    def _on_uniform_enabled_toggled(self, checked: bool) -> None:
+        _ = checked
+        self._update_uniform_controls_enabled()
+        self._update_yolo_profile_summary()
+        self._on_setting_changed()
 
     def _on_yolo_profile_changed(self) -> None:
         if self._suppress_setting_autosave:
@@ -2825,7 +3268,35 @@ class InferenceWindow(QMainWindow):
             current_loaded_name = current_loaded_path.name.strip().lower()
         elif self.model_reference:
             current_loaded_name = Path(str(self.model_reference)).name.strip().lower()
-        return bool(desired_name) and desired_name != current_loaded_name
+        primary_changed = bool(desired_name) and desired_name != current_loaded_name
+        if primary_changed:
+            return True
+
+        seg_cfg = self._day_segmentation_model_cfg()
+        seg_enabled = self._uniform_detection_enabled() and bool(seg_cfg.get("enabled", True))
+        if not seg_enabled:
+            return self.day_seg_model is not None
+
+        desired_seg_path_raw = str(seg_cfg.get("selected_model_path", "")).strip()
+        current_seg_path = (
+            self.current_day_seg_model_path.resolve()
+            if self.current_day_seg_model_path and self.current_day_seg_model_path.exists()
+            else None
+        )
+        if desired_seg_path_raw:
+            try:
+                desired_seg_path = resolve_path(desired_seg_path_raw).resolve()
+            except Exception:  # noqa: BLE001
+                return True
+            return current_seg_path is None or desired_seg_path != current_seg_path
+
+        desired_seg_name = str(seg_cfg.get("name", "")).strip().lower()
+        current_seg_name = ""
+        if current_seg_path is not None:
+            current_seg_name = current_seg_path.name.strip().lower()
+        elif self.day_seg_model_reference:
+            current_seg_name = Path(str(self.day_seg_model_reference)).name.strip().lower()
+        return bool(desired_seg_name) and desired_seg_name != current_seg_name
 
     def _set_controls_from_config(self) -> None:
         self.security_mode_combo.setCurrentText(str(self.security_cfg.get("mode", "auto")))
@@ -2841,6 +3312,14 @@ class InferenceWindow(QMainWindow):
             {
                 "model_name": str(self.model_cfg.get("name", "yolo26s.pt")),
                 "selected_model_path": str(self.model_cfg.get("selected_model_path", "")).strip(),
+            }
+        )
+        self._populate_day_seg_model_combo()
+        day_seg_cfg = self._day_segmentation_model_cfg()
+        self._set_day_seg_model_combo_value(
+            {
+                "model_name": str(day_seg_cfg.get("name", DEFAULT_DAY_SEG_MODEL_NAME)),
+                "selected_model_path": str(day_seg_cfg.get("selected_model_path", "")).strip(),
             }
         )
         self._set_imgsz_combo_value(int(self.inference_cfg.get("imgsz", 960)))
@@ -2862,6 +3341,19 @@ class InferenceWindow(QMainWindow):
         self.events_save_annotated_checkbox.setChecked(bool(self.events_cfg.get("save_annotated_frame", True)))
         self.events_once_per_streak_checkbox.setChecked(bool(self.events_cfg.get("once_per_streak", True)))
         self.events_output_dir_edit.setText(str(self.events_cfg.get("output_dir", "logs/app/events")))
+        self.uniform_enabled_checkbox.setChecked(bool(self.uniform_cfg.get("enabled", True)))
+        self.uniform_tolerance_spin.setValue(float(self.uniform_cfg.get("color_tolerance", UNIFORM_COLOR_TOLERANCE_DEFAULT)))
+        self.uniform_min_pixels_spin.setValue(int(self.uniform_cfg.get("min_mask_pixels", UNIFORM_MIN_MASK_PIXELS_DEFAULT)))
+        self._selected_uniform_top_color = _normalize_hex_color(
+            self.uniform_cfg.get("top_color", UNIFORM_TOP_DEFAULT),
+            UNIFORM_TOP_DEFAULT,
+        )
+        self._selected_uniform_bottom_color = _normalize_hex_color(
+            self.uniform_cfg.get("bottom_color", UNIFORM_BOTTOM_DEFAULT),
+            UNIFORM_BOTTOM_DEFAULT,
+        )
+        self._sync_uniform_preview()
+        self._update_uniform_controls_enabled()
 
         detected_profile_key = self._infer_yolo_profile_key()
         self._set_combo_to_data(self.yolo_profile_combo, detected_profile_key)
@@ -2888,10 +3380,14 @@ class InferenceWindow(QMainWindow):
         self.iou_spin.valueChanged.connect(self._on_yolo_manual_control_changed)
         self.imgsz_combo.currentIndexChanged.connect(self._on_yolo_manual_control_changed)
         self.max_det_spin.valueChanged.connect(self._on_yolo_manual_control_changed)
+        self.yolo_day_seg_model_combo.currentIndexChanged.connect(self._on_day_seg_manual_control_changed)
         self.device_edit.textChanged.connect(self._on_setting_changed)
         self.half_checkbox.toggled.connect(self._on_setting_changed)
         self.compile_checkbox.toggled.connect(self._on_setting_changed)
         self.start_maximized_checkbox.toggled.connect(self._on_setting_changed)
+        self.uniform_enabled_checkbox.toggled.connect(self._on_uniform_enabled_toggled)
+        self.uniform_tolerance_spin.valueChanged.connect(self._on_setting_changed)
+        self.uniform_min_pixels_spin.valueChanged.connect(self._on_setting_changed)
         self.events_enabled_checkbox.toggled.connect(self._on_setting_changed)
         self.events_min_visible_spin.valueChanged.connect(self._on_setting_changed)
         self.events_cooldown_spin.valueChanged.connect(self._on_setting_changed)
@@ -2952,12 +3448,13 @@ class InferenceWindow(QMainWindow):
             QMessageBox.critical(self, "Reset ustawien", "Domyslny config ma nieprawidlowy format.")
             return
 
-        for key in ("model", "inference", "tracker", "security", "events", "runtime"):
+        for key in ("model", "inference", "tracker", "security", "uniform", "events", "runtime"):
             self.config[key] = dict(defaults.get(key, {}) or {})
 
         self.model_cfg = dict(self.config.get("model", {}) or {})
         self.inference_cfg = dict(self.config.get("inference", {}) or {})
         self.security_cfg = dict(self.config.get("security", {}) or {})
+        self.uniform_cfg = dict(self.config.get("uniform", {}) or {})
         self.runtime_cfg = dict(self.config.get("runtime", {}) or {})
         self.tracker_cfg = dict(self.config.get("tracker", {}) or {})
         self.events_cfg = dict(self.config.get("events", {}) or {})
@@ -2985,6 +3482,7 @@ class InferenceWindow(QMainWindow):
             "inference": dict(self.inference_cfg),
             "tracker": dict(self.tracker_cfg),
             "security": dict(self.security_cfg),
+            "uniform": dict(self.uniform_cfg),
             "events": dict(self.events_cfg),
             "runtime": dict(self.runtime_cfg),
         }
@@ -3046,13 +3544,14 @@ class InferenceWindow(QMainWindow):
             return
 
         previous_settings = self._snapshot_settings_state()
-        for key in ("model", "inference", "tracker", "security", "events", "runtime"):
+        for key in ("model", "inference", "tracker", "security", "uniform", "events", "runtime"):
             if key in payload and isinstance(payload.get(key), dict):
                 self.config[key] = dict(payload.get(key, {}) or {})
 
         self.model_cfg = dict(self.config.get("model", {}) or {})
         self.inference_cfg = dict(self.config.get("inference", {}) or {})
         self.security_cfg = dict(self.config.get("security", {}) or {})
+        self.uniform_cfg = dict(self.config.get("uniform", {}) or {})
         self.runtime_cfg = dict(self.config.get("runtime", {}) or {})
         self.tracker_cfg = dict(self.config.get("tracker", {}) or {})
         self.events_cfg = dict(self.config.get("events", {}) or {})
@@ -3212,7 +3711,7 @@ class InferenceWindow(QMainWindow):
                     if not isinstance(asset, dict):
                         continue
                     name = str(asset.get("name", "")).strip().lower()
-                    if re.fullmatch(r"yolo(?:v?\d+)[nslmx]\.pt", name):
+                    if re.fullmatch(r"yolo(?:v?\d+)[nslmx](?:-seg)?\.pt", name):
                         model_names.add(name)
         except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError) as exc:
             if not self._online_model_suggestions_error_logged:
@@ -3477,6 +3976,14 @@ class InferenceWindow(QMainWindow):
                     model_name = f"{model_name}.pt"
                 suggested_names_set.add(model_name)
 
+        day_seg_cfg = self._day_segmentation_model_cfg()
+        day_seg_model_name = str(day_seg_cfg.get("name", DEFAULT_DAY_SEG_MODEL_NAME)).strip()
+        if day_seg_model_name:
+            if not day_seg_model_name.lower().endswith(".pt"):
+                day_seg_model_name = f"{day_seg_model_name}.pt"
+            suggested_names_set.add(day_seg_model_name)
+        suggested_names_set.update(DAY_SEG_MODEL_SUGGESTIONS)
+
         suggested_names_set.update(self._fetch_online_suggested_model_names())
 
         suggested_names = sorted(suggested_names_set)
@@ -3513,6 +4020,8 @@ class InferenceWindow(QMainWindow):
         self._populate_model_table()
         if hasattr(self, "yolo_model_combo") and self.yolo_model_combo is not None:
             self._populate_yolo_model_combo()
+        if hasattr(self, "yolo_day_seg_model_combo") and self.yolo_day_seg_model_combo is not None:
+            self._populate_day_seg_model_combo()
 
     def _update_current_model_label(self) -> None:
         if not hasattr(self, "current_model_label") or self.current_model_label is None:
@@ -3616,18 +4125,68 @@ class InferenceWindow(QMainWindow):
 
         self._update_current_model_label()
 
-    def _apply_selected_model(self) -> None:
+    def _selected_model_table_entry(self) -> dict[str, Any] | None:
         row = self.model_table.currentRow()
         if row < 0 or row >= len(self.model_table_row_map):
-            QMessageBox.information(self, "Model", "Najpierw wybierz wiersz modelu.")
-            return
-
+            return None
         catalog_index = self.model_table_row_map[row]
         if catalog_index is None or catalog_index < 0 or catalog_index >= len(self.model_catalog):
+            return None
+        return self.model_catalog[catalog_index]
+
+    def _apply_selected_model(self) -> None:
+        entry = self._selected_model_table_entry()
+        if entry is None:
             QMessageBox.information(self, "Model", "Najpierw wybierz wiersz modelu.")
             return
 
-        entry = self.model_catalog[catalog_index]
+        if self._entry_is_segmentation_model(entry):
+            model_name = str(entry.get("model_name", entry.get("name", ""))).strip()
+            model_path = Path(entry["path"]).resolve()
+            missing = bool(entry.get("missing", False)) or not model_path.exists()
+            seg_cfg = self._day_segmentation_model_cfg()
+            seg_cfg["name"] = model_name or str(seg_cfg.get("name", DEFAULT_DAY_SEG_MODEL_NAME)).strip()
+            if missing:
+                reply = QMessageBox.question(
+                    self,
+                    "Model segmentacji",
+                    f"Model {model_name or model_path.name} nie istnieje lokalnie. Pobierac teraz?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.Yes,
+                )
+                if reply != QMessageBox.StandardButton.Yes:
+                    return
+                try:
+                    model, reference = load_yolo_model(seg_cfg, base_dir=Path.cwd())
+                    del model
+                    resolved_reference = Path(reference)
+                    if resolved_reference.exists():
+                        model_path = resolved_reference.resolve()
+                except Exception as exc:  # noqa: BLE001
+                    QMessageBox.critical(self, "Model segmentacji", f"Nie mozna zaladowac modelu segmentacji:\n{exc}")
+                    return
+
+            if model_path.exists():
+                seg_cfg["selected_model_path"] = _to_relative_or_abs(model_path)
+            else:
+                seg_cfg["selected_model_path"] = ""
+            self.model_cfg["day_segmentation"] = dict(seg_cfg)
+
+            try:
+                self._reload_model_from_config()
+            except Exception:
+                return
+
+            self._suppress_setting_autosave = True
+            try:
+                self._populate_day_seg_model_combo()
+                self._set_day_seg_model_combo_value(self.model_cfg["day_segmentation"])
+            finally:
+                self._suppress_setting_autosave = False
+            self._persist_config(show_message=False)
+            self._log(f"Day segmentation model switched to: {model_path}")
+            return
+
         model_path = Path(entry["path"]).resolve()
         missing = bool(entry.get("missing", False)) or not model_path.exists()
         if missing:
@@ -3697,12 +4256,11 @@ class InferenceWindow(QMainWindow):
             self.start_live()
 
     def _download_selected_model(self) -> None:
-        row = self.model_table.currentRow()
-        if row < 0 or row >= len(self.model_catalog):
+        entry = self._selected_model_table_entry()
+        if entry is None:
             QMessageBox.information(self, "Model", "Najpierw wybierz wiersz modelu.")
             return
 
-        entry = self.model_catalog[row]
         model_name = str(entry.get("model_name", entry.get("name", ""))).strip()
         model_path = Path(entry["path"]).resolve()
         if model_path.exists() and not entry.get("missing", False):
@@ -3720,15 +4278,59 @@ class InferenceWindow(QMainWindow):
             return
 
         try:
-            self.model_cfg["name"] = model_name or self.model_cfg.get("name", "")
-            self.model_cfg["selected_model_path"] = ""
-            model, _reference = load_yolo_model(self.model_cfg, base_dir=Path.cwd())
+            target_cfg = dict(self._day_segmentation_model_cfg()) if self._entry_is_segmentation_model(entry) else dict(self.model_cfg)
+            target_cfg["name"] = model_name or str(target_cfg.get("name", "")).strip()
+            target_cfg["selected_model_path"] = ""
+            model, reference = load_yolo_model(target_cfg, base_dir=Path.cwd())
             del model
         except Exception as exc:  # noqa: BLE001
             QMessageBox.critical(self, "Model", f"Nie mozna pobrac modelu:\n{exc}")
             return
 
+        if self._entry_is_segmentation_model(entry):
+            self.model_cfg["day_segmentation"] = dict(target_cfg)
+            resolved = Path(reference)
+            if resolved.exists():
+                self.model_cfg["day_segmentation"]["selected_model_path"] = _to_relative_or_abs(resolved.resolve())
+            self._set_day_seg_model_combo_value(self.model_cfg["day_segmentation"])
+
         self._refresh_model_catalog()
+        self._update_yolo_profile_summary()
+        self._on_setting_changed()
+
+    def _download_selected_day_seg_model(self) -> None:
+        selection = self._current_day_seg_model_selection()
+        model_name = str(selection.get("model_name", "")).strip() or DEFAULT_DAY_SEG_MODEL_NAME
+        seg_cfg = self._day_segmentation_model_cfg()
+        seg_cfg["name"] = model_name
+        seg_cfg["selected_model_path"] = ""
+
+        reply = QMessageBox.question(
+            self,
+            "Model segmentacji",
+            f"Pobrac model segmentacji {model_name}?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        try:
+            model, reference = load_yolo_model(seg_cfg, base_dir=Path.cwd())
+            del model
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.critical(self, "Model segmentacji", f"Nie mozna pobrac modelu segmentacji:\n{exc}")
+            return
+
+        self.model_cfg["day_segmentation"] = dict(seg_cfg)
+        resolved = Path(reference)
+        if resolved.exists():
+            self.model_cfg["day_segmentation"]["selected_model_path"] = _to_relative_or_abs(resolved.resolve())
+        self._refresh_model_catalog()
+        self._populate_day_seg_model_combo()
+        self._set_day_seg_model_combo_value(self.model_cfg["day_segmentation"])
+        self._update_yolo_profile_summary()
+        self._on_setting_changed()
 
     # ---------- sources ----------
     def _normalize_sources_entries(self, raw_sources: Any) -> list[dict[str, Any]]:
@@ -4933,7 +5535,8 @@ class InferenceWindow(QMainWindow):
                 continue
 
             try:
-                batch_results = self._predict_batch_with_fallback(frame_batch)
+                mode = resolve_security_mode(self.security_cfg)
+                batch_results = self._predict_batch_for_mode(frame_batch, mode)
             except Exception as exc:  # noqa: BLE001
                 with self._infer_lock:
                     self._infer_worker_error = (
@@ -4950,18 +5553,17 @@ class InferenceWindow(QMainWindow):
                     f"expected={len(source_batch)} got={len(batch_results)}"
                 )
 
-            mode = resolve_security_mode(self.security_cfg)
             for idx in range(count):
                 source_name = source_batch[idx]
                 frame = frame_batch[idx]
                 result = batch_results[idx]
-                boxes = self._extract_tracked_person_boxes(source_name, None, result, frame)
-                tracked_ids = {box[5] for box in boxes if len(box) >= 6 and box[5] is not None}
-                person_count = len(tracked_ids) if tracked_ids else len(boxes)
-                alert = should_raise_alert(person_count, mode, self.security_cfg)
+                boxes, person_count, intruder_count = self._extract_mode_detections(source_name, None, result, frame, mode)
+                alert_value = intruder_count if mode == "day" else person_count
+                alert = should_raise_alert(alert_value, mode, self.security_cfg)
                 payload = AsyncInferenceResult(
                     infer_ts=now,
                     person_count=person_count,
+                    intruder_count=intruder_count,
                     mode=mode,
                     alert=alert,
                     boxes=boxes,
@@ -4994,6 +5596,7 @@ class InferenceWindow(QMainWindow):
                 runtime.infer_fps = 1.0 / infer_delta
             runtime.last_infer_ts = payload.infer_ts
             runtime.person_count = payload.person_count
+            runtime.intruder_count = payload.intruder_count
             runtime.mode = payload.mode
             runtime.alert = payload.alert
             runtime.last_boxes = payload.boxes
@@ -5279,6 +5882,8 @@ class InferenceWindow(QMainWindow):
         runtime.display_infer_fps = 0.0
         runtime.last_meta_fps_update_ts = 0.0
         runtime.last_render_ts = 0.0
+        runtime.person_count = 0
+        runtime.intruder_count = 0
         runtime.last_boxes = None
         runtime.last_decorated_capture_seq = 0
         runtime.last_decorated_infer_ts = 0.0
@@ -5401,8 +6006,14 @@ class InferenceWindow(QMainWindow):
                 results = self.model.predict(frames, **self.predict_kwargs)
                 return list(results)
 
-    def _extract_person_boxes(self, result: Any) -> list[TrackedBox]:
-        boxes: list[TrackedBox] = []
+    def _predict_batch_for_mode(self, frames: list[np.ndarray], mode: str) -> list[Any]:
+        if mode == "day" and self._uniform_detection_enabled() and self.day_seg_model is not None:
+            with self._model_lock:
+                return list(self.day_seg_model.predict(frames, **self.day_seg_predict_kwargs))
+        return self._predict_batch_with_fallback(frames)
+
+    def _extract_person_boxes(self, result: Any) -> list[PersonDetection]:
+        boxes: list[PersonDetection] = []
         raw_boxes = getattr(result, "boxes", None)
         if raw_boxes is None:
             return boxes
@@ -5429,9 +6040,97 @@ class InferenceWindow(QMainWindow):
             x1, y1, x2, y2 = int(coords[0]), int(coords[1]), int(coords[2]), int(coords[3])
             if x2 <= x1 or y2 <= y1:
                 continue
-            boxes.append((x1, y1, x2, y2, float(conf), None))
+            boxes.append(PersonDetection(x1=x1, y1=y1, x2=x2, y2=y2, conf=float(conf), track_id=None))
 
         return boxes
+
+    def _extract_person_segmentation_candidates(
+        self,
+        result: Any,
+    ) -> list[tuple[PersonDetection, np.ndarray | None]]:
+        detections = self._extract_person_boxes(result)
+        if not detections:
+            return []
+
+        raw_masks = getattr(result, "masks", None)
+        mask_arrays: list[np.ndarray | None] = [None] * len(detections)
+        if raw_masks is not None:
+            try:
+                mask_data = raw_masks.data
+                mask_array_values = mask_data.cpu().numpy() if hasattr(mask_data, "cpu") else np.asarray(mask_data)
+                if mask_array_values.ndim == 3:
+                    limit = min(len(mask_arrays), int(mask_array_values.shape[0]))
+                    for index in range(limit):
+                        mask_arrays[index] = (mask_array_values[index] > 0.5).astype(np.uint8) * 255
+            except Exception:  # noqa: BLE001
+                pass
+        return list(zip(detections, mask_arrays))
+
+    def _analyze_day_uniform_detections(self, frame: np.ndarray, result: Any) -> list[PersonDetection]:
+        candidates = self._extract_person_segmentation_candidates(result)
+        if not candidates:
+            return []
+
+        tolerance = float(self.uniform_cfg.get("color_tolerance", UNIFORM_COLOR_TOLERANCE_DEFAULT))
+        min_pixels = max(20, int(self.uniform_cfg.get("min_mask_pixels", UNIFORM_MIN_MASK_PIXELS_DEFAULT)))
+        target_upper_hex = _normalize_hex_color(self.uniform_cfg.get("top_color", UNIFORM_TOP_DEFAULT), UNIFORM_TOP_DEFAULT)
+        target_lower_hex = _normalize_hex_color(self.uniform_cfg.get("bottom_color", UNIFORM_BOTTOM_DEFAULT), UNIFORM_BOTTOM_DEFAULT)
+        target_upper_bgr = _hex_to_bgr(target_upper_hex)
+        target_lower_bgr = _hex_to_bgr(target_lower_hex)
+
+        detections: list[PersonDetection] = []
+        frame_h, frame_w = frame.shape[:2]
+        for detection, seg_mask in candidates:
+            working_mask = seg_mask
+            if working_mask is None:
+                working_mask = np.zeros((frame_h, frame_w), dtype=np.uint8)
+                working_mask[max(0, detection.y1):min(frame_h, detection.y2), max(0, detection.x1):min(frame_w, detection.x2)] = 255
+                detection.has_segmentation = False
+            else:
+                if working_mask.shape[0] != frame_h or working_mask.shape[1] != frame_w:
+                    try:
+                        working_mask = cv2.resize(working_mask, (frame_w, frame_h), interpolation=cv2.INTER_NEAREST)
+                    except Exception:  # noqa: BLE001
+                        working_mask = None
+                detection.has_segmentation = working_mask is not None
+
+            if working_mask is None:
+                detections.append(detection)
+                continue
+
+            person_height = max(1, detection.y2 - detection.y1)
+            upper_sample = _compute_region_color(
+                frame,
+                working_mask,
+                detection.y1 + int(person_height * 0.18),
+                detection.y1 + int(person_height * 0.58),
+            )
+            lower_sample = _compute_region_color(
+                frame,
+                working_mask,
+                detection.y1 + int(person_height * 0.55),
+                detection.y1 + int(person_height * 0.98),
+            )
+
+            upper_match: bool | None = None
+            lower_match: bool | None = None
+            if upper_sample is not None:
+                detection.upper_color_hex = upper_sample[0]
+                if upper_sample[1] >= min_pixels:
+                    upper_match = _lab_color_distance(_hex_to_bgr(upper_sample[0]), target_upper_bgr) <= tolerance
+            if lower_sample is not None:
+                detection.lower_color_hex = lower_sample[0]
+                if lower_sample[1] >= min_pixels:
+                    lower_match = _lab_color_distance(_hex_to_bgr(lower_sample[0]), target_lower_bgr) <= tolerance
+
+            detection.upper_match = upper_match
+            detection.lower_match = lower_match
+            detection.uniform_match = (upper_match is not False) and (lower_match is not False)
+            detection.is_intruder = bool(upper_match is False or lower_match is False)
+            detection.label = "intruder" if detection.is_intruder else "worker"
+            detections.append(detection)
+
+        return detections
 
     def _extract_tracked_person_boxes(
         self,
@@ -5439,7 +6138,7 @@ class InferenceWindow(QMainWindow):
         runtime: SourceRuntime | None,
         result: Any,
         frame: np.ndarray,
-    ) -> list[TrackedBox]:
+    ) -> list[PersonDetection]:
         if not self.tracker_enabled:
             return self._extract_person_boxes(result)
 
@@ -5472,7 +6171,7 @@ class InferenceWindow(QMainWindow):
             self._reset_tracker_for_source(source_name, runtime)
             return self._extract_person_boxes(result)
 
-        boxes: list[TrackedBox] = []
+        boxes: list[PersonDetection] = []
         if tracks is None or len(tracks) == 0:
             return boxes
 
@@ -5494,29 +6193,61 @@ class InferenceWindow(QMainWindow):
                 parsed_track_id: int | None = int(track_id)
             except Exception:  # noqa: BLE001
                 parsed_track_id = None
-            boxes.append((ix1, iy1, ix2, iy2, float(score), parsed_track_id))
+            boxes.append(
+                PersonDetection(
+                    x1=ix1,
+                    y1=iy1,
+                    x2=ix2,
+                    y2=iy2,
+                    conf=float(score),
+                    track_id=parsed_track_id,
+                )
+            )
         return boxes
+
+    def _extract_mode_detections(
+        self,
+        source_name: str,
+        runtime: SourceRuntime | None,
+        result: Any,
+        frame: np.ndarray,
+        mode: str,
+    ) -> tuple[list[PersonDetection], int, int]:
+        if mode == "day" and self._uniform_detection_enabled():
+            detections = self._analyze_day_uniform_detections(frame, result)
+            intruder_count = sum(1 for detection in detections if detection.is_intruder)
+            return detections, len(detections), intruder_count
+
+        detections = self._extract_tracked_person_boxes(source_name, runtime, result, frame)
+        tracked_ids = {detection.track_id for detection in detections if detection.track_id is not None}
+        person_count = len(tracked_ids) if tracked_ids else len(detections)
+        intruder_count = person_count if mode == "night" or not self._uniform_detection_enabled() else 0
+        for detection in detections:
+            detection.is_intruder = mode == "night" or not self._uniform_detection_enabled()
+            detection.uniform_match = None
+            detection.label = "intruder" if detection.is_intruder else "person"
+        return detections, person_count, intruder_count
 
     def _draw_person_boxes(
         self,
         frame: np.ndarray,
-        boxes: list[TrackedBox] | None,
+        boxes: list[PersonDetection] | None,
     ) -> np.ndarray:
         output = frame.copy()
         if not boxes:
             return output
 
-        for box in boxes:
-            if len(box) >= 6:
-                x1, y1, x2, y2, conf, track_id = box[:6]
+        for detection in boxes:
+            x1, y1, x2, y2 = detection.x1, detection.y1, detection.x2, detection.y2
+            box_color = (0, 0, 255) if detection.is_intruder else (42, 169, 107)
+            if detection.uniform_match is None and not detection.is_intruder:
+                box_color = (255, 176, 0)
+            cv2.rectangle(output, (x1, y1), (x2, y2), box_color, 2)
+            if detection.track_id is None:
+                base_label = detection.label or "person"
             else:
-                x1, y1, x2, y2, conf = box[:5]
-                track_id = None
-            cv2.rectangle(output, (x1, y1), (x2, y2), (255, 80, 40), 2)
-            if track_id is None:
-                label = f"person {conf:.2f}"
-            else:
-                label = f"person#{track_id} {conf:.2f}"
+                base_label = f"{detection.label or 'person'}#{detection.track_id}"
+            label = f"{base_label} {detection.conf:.2f}"
             (tw, th), baseline = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)
             text_y = max(18, y1 - 6)
             top = max(0, text_y - th - baseline - 4)
@@ -5524,7 +6255,7 @@ class InferenceWindow(QMainWindow):
                 output,
                 (x1, top),
                 (x1 + tw + 8, text_y + 2),
-                (255, 80, 40),
+                box_color,
                 -1,
             )
             cv2.putText(
@@ -5546,12 +6277,13 @@ class InferenceWindow(QMainWindow):
         source_name: str,
         mode: str,
         person_count: int,
+        intruder_count: int,
         alert: bool,
-        boxes: list[TrackedBox] | None = None,
+        boxes: list[PersonDetection] | None = None,
     ) -> np.ndarray:
         color = (0, 0, 255) if alert else (0, 185, 0)
         status = "ALERT" if alert else "OK"
-        text = f"{source_name} | mode:{mode} | person:{person_count} | {status}"
+        text = f"{source_name} | mode:{mode} | person:{person_count} | intruder:{intruder_count} | {status}"
 
         output = self._draw_person_boxes(frame, boxes)
         cv2.putText(output, text, (10, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.65, color, 2, cv2.LINE_AA)
@@ -5608,7 +6340,7 @@ class InferenceWindow(QMainWindow):
             mask_on = bool(source.get("ignore_polys") or source.get("ignore_poly") or source.get("ignore_rect"))
         mask_text = " | mask:on" if mask_on else ""
         meta = (
-            f"{runtime.status} | mode:{runtime.mode} | person:{runtime.person_count} "
+            f"{runtime.status} | mode:{runtime.mode} | person:{runtime.person_count} | intruder:{runtime.intruder_count} "
             f"| src:{shown_source_fps:.1f} | view:{shown_view_fps:.1f} | ai:{shown_ai_fps:.1f}{mask_text}"
         )
 
@@ -5659,6 +6391,8 @@ class InferenceWindow(QMainWindow):
                 runtime.last_output = None
                 runtime.status = "no-frame"
                 runtime.fps = 0.0
+                runtime.person_count = 0
+                runtime.intruder_count = 0
                 runtime.person_visible_since_ts = 0.0
                 runtime.person_visible_duration_sec = 0.0
                 runtime.event_saved_in_streak = False
@@ -5715,6 +6449,7 @@ class InferenceWindow(QMainWindow):
                 source_name=source_name,
                 mode=runtime.mode,
                 person_count=runtime.person_count,
+                intruder_count=runtime.intruder_count,
                 alert=runtime.alert,
                 boxes=boxes,
             )
@@ -5983,6 +6718,7 @@ class InferenceWindow(QMainWindow):
                         "source": "source",
                         "mode": "day",
                         "persons": 0,
+                        "intruders": 0,
                         "visible_sec": 0.0,
                         "alert": False,
                         "file": _to_relative_or_abs(file_path),
@@ -6026,6 +6762,7 @@ class InferenceWindow(QMainWindow):
                     "source": str(raw.get("source", "source")),
                     "mode": str(raw.get("mode", "day")),
                     "persons": int(raw.get("persons", 0) or 0),
+                    "intruders": int(raw.get("intruders", raw.get("persons", 0)) or 0),
                     "visible_sec": float(raw.get("visible_sec", 0.0) or 0.0),
                     "alert": bool(raw.get("alert", False)),
                     "file": _to_relative_or_abs(file_path),
@@ -6733,6 +7470,7 @@ class InferenceWindow(QMainWindow):
             "source": source_name,
             "mode": runtime.mode,
             "persons": max_person_count,
+            "intruders": max_person_count,
             "visible_sec": visible_sec,
             "alert": bool(runtime.alert),
             "file": _to_relative_or_abs(output_path),
@@ -6754,7 +7492,7 @@ class InferenceWindow(QMainWindow):
         self._refresh_events_table(select_newest=show_latest)
         self._log(
             f"Event saved: {source_name}, visible={visible_sec:.1f}s, "
-            f"persons={runtime.person_count}, file={output_path}"
+            f"persons={runtime.person_count}, intruders={runtime.intruder_count}, file={output_path}"
         )
 
     def _ensure_event_clip_writer(self, source_name: str, runtime: SourceRuntime, frame: np.ndarray) -> bool:
@@ -6793,19 +7531,20 @@ class InferenceWindow(QMainWindow):
         return True
 
     def _update_event_visibility_state(self, source_name: str, runtime: SourceRuntime, now_ts: float) -> None:
-        person_present = runtime.person_count >= self.events_min_person_count and runtime.last_infer_ts > 0
-        if person_present:
+        visible_count = runtime.intruder_count if runtime.mode == "day" else runtime.person_count
+        suspicious_present = visible_count >= self.events_min_person_count and runtime.last_infer_ts > 0
+        if suspicious_present:
             if runtime.person_visible_since_ts <= 0.0:
                 runtime.person_visible_since_ts = now_ts
                 runtime.person_visible_duration_sec = 0.0
                 runtime.event_saved_in_streak = False
                 runtime.event_clip_started_wall_ts = time.time()
                 runtime.event_last_seen_ts = now_ts
-                runtime.event_max_person_count = int(runtime.person_count)
+                runtime.event_max_person_count = int(visible_count)
             else:
                 runtime.person_visible_duration_sec = max(0.0, now_ts - runtime.person_visible_since_ts)
                 runtime.event_last_seen_ts = now_ts
-                runtime.event_max_person_count = max(runtime.event_max_person_count, int(runtime.person_count))
+                runtime.event_max_person_count = max(runtime.event_max_person_count, int(visible_count))
             return
 
         if runtime.person_visible_since_ts > 0.0:
@@ -6901,6 +7640,14 @@ class InferenceWindow(QMainWindow):
             self.model_cfg["name"] = selected_model_name
         self.model_cfg["selected_model_path"] = selected_model_path
 
+        day_seg_selection = self._current_day_seg_model_selection()
+        day_seg_cfg = self._day_segmentation_model_cfg()
+        if day_seg_selection["model_name"]:
+            day_seg_cfg["name"] = day_seg_selection["model_name"]
+        day_seg_cfg["selected_model_path"] = day_seg_selection["selected_model_path"]
+        day_seg_cfg["enabled"] = bool(self.uniform_enabled_checkbox.isChecked())
+        self.model_cfg["day_segmentation"] = dict(day_seg_cfg)
+
         raw_device = self.device_edit.text().strip()
         if raw_device.lower() in {"", "auto", "none"}:
             self.inference_cfg["device"] = "auto"
@@ -6925,6 +7672,18 @@ class InferenceWindow(QMainWindow):
         self.runtime_cfg["suppress_opencv_warnings"] = bool(self.suppress_opencv_warnings)
         self.runtime_cfg["auto_scan_cameras_on_startup"] = bool(self.auto_scan_cameras_on_startup)
         self.runtime_cfg["auto_start_live"] = bool(self.auto_start_live)
+
+        self.uniform_cfg["enabled"] = bool(self.uniform_enabled_checkbox.isChecked())
+        self.uniform_cfg["top_color"] = _normalize_hex_color(
+            getattr(self, "_selected_uniform_top_color", self.uniform_cfg.get("top_color", UNIFORM_TOP_DEFAULT)),
+            UNIFORM_TOP_DEFAULT,
+        )
+        self.uniform_cfg["bottom_color"] = _normalize_hex_color(
+            getattr(self, "_selected_uniform_bottom_color", self.uniform_cfg.get("bottom_color", UNIFORM_BOTTOM_DEFAULT)),
+            UNIFORM_BOTTOM_DEFAULT,
+        )
+        self.uniform_cfg["color_tolerance"] = float(self.uniform_tolerance_spin.value())
+        self.uniform_cfg["min_mask_pixels"] = int(self.uniform_min_pixels_spin.value())
 
         previous_output_dir = self.events_output_dir
         previous_output_raw = self.events_output_dir_raw
@@ -6968,6 +7727,9 @@ class InferenceWindow(QMainWindow):
 
         if self.current_model_path is not None and self.current_model_path.exists():
             self.model_cfg["selected_model_path"] = _to_relative_or_abs(self.current_model_path)
+        if self.current_day_seg_model_path is not None and self.current_day_seg_model_path.exists():
+            self.model_cfg["day_segmentation"] = dict(self.model_cfg.get("day_segmentation", {}) or {})
+            self.model_cfg["day_segmentation"]["selected_model_path"] = _to_relative_or_abs(self.current_day_seg_model_path)
 
     def _persist_config(
         self,
@@ -6985,6 +7747,7 @@ class InferenceWindow(QMainWindow):
         self.config["inference"] = dict(self.inference_cfg)
         self.config["tracker"] = dict(self.tracker_cfg)
         self.config["security"] = dict(self.security_cfg)
+        self.config["uniform"] = dict(self.uniform_cfg)
         self.config["events"] = dict(self.events_cfg)
         self.config["runtime"] = dict(self.runtime_cfg)
         self.config.pop("sources", None)
