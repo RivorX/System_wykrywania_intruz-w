@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import shutil
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import requests
 from tqdm import tqdm
@@ -11,20 +11,29 @@ from ultralytics import YOLO
 from .config_utils import ensure_dir, resolve_path
 
 
+ProgressCallback = Callable[[str, int | None, int | None], None]
+
+
 def download_file(
     url: str,
     destination: Path,
     timeout: int = 120,
     show_progress: bool = True,
     chunk_size: int = 1024 * 1024,
+    progress_callback: ProgressCallback | None = None,
 ) -> None:
     destination.parent.mkdir(parents=True, exist_ok=True)
+    if progress_callback is not None:
+        progress_callback(f"Laczenie z serwerem: {url}", 0, None)
     with requests.get(url, stream=True, timeout=timeout) as response:
         response.raise_for_status()
         with destination.open("wb") as file:
             if show_progress:
                 total = int(response.headers.get("content-length", 0))
                 progress_total = total if total > 0 else None
+                if progress_callback is not None:
+                    progress_callback(f"Pobieranie {destination.name}", 0, progress_total)
+                downloaded = 0
                 with tqdm(
                     total=progress_total,
                     unit="B",
@@ -36,14 +45,30 @@ def download_file(
                             continue
                         file.write(chunk)
                         progress.update(len(chunk))
+                        downloaded += len(chunk)
+                        if progress_callback is not None:
+                            progress_callback(f"Pobieranie {destination.name}", downloaded, progress_total)
             else:
+                if progress_callback is not None:
+                    progress_callback(f"Pobieranie {destination.name}", 0, None)
+                downloaded = 0
                 for chunk in response.iter_content(chunk_size=chunk_size):
                     if not chunk:
                         continue
                     file.write(chunk)
+                    downloaded += len(chunk)
+                    if progress_callback is not None:
+                        progress_callback(f"Pobieranie {destination.name}", downloaded, None)
+
+    if progress_callback is not None:
+        progress_callback(f"Pobieranie {destination.name} zakonczone", None, None)
 
 
-def ensure_model_reference(model_cfg: dict[str, Any], base_dir: Path | None = None) -> str:
+def ensure_model_reference(
+    model_cfg: dict[str, Any],
+    base_dir: Path | None = None,
+    progress_callback: ProgressCallback | None = None,
+) -> str:
     model_name = str(model_cfg.get("name", "yolo26m.pt")).strip()
     if not model_name:
         raise ValueError("Model name cannot be empty.")
@@ -55,6 +80,8 @@ def ensure_model_reference(model_cfg: dict[str, Any], base_dir: Path | None = No
         local_model_path.unlink()
 
     if local_model_path.exists():
+        if progress_callback is not None:
+            progress_callback(f"Model lokalny dostepny: {local_model_path.name}", None, None)
         return str(local_model_path)
 
     auto_download = bool(model_cfg.get("auto_download", True))
@@ -62,10 +89,12 @@ def ensure_model_reference(model_cfg: dict[str, Any], base_dir: Path | None = No
 
     if auto_download and model_url:
         print(f"[model] Downloading {model_name} from configured URL.")
-        download_file(str(model_url), local_model_path)
+        download_file(str(model_url), local_model_path, progress_callback=progress_callback)
         return str(local_model_path)
 
     # Returning model_name allows Ultralytics to auto-download official weights.
+    if progress_callback is not None:
+        progress_callback(f"Ladowanie modelu przez Ultralytics: {model_name}", None, None)
     return model_name
 
 
@@ -130,8 +159,12 @@ def _persist_model_to_local_dir(
     return reference
 
 
-def load_yolo_model(model_cfg: dict[str, Any], base_dir: Path | None = None) -> tuple[YOLO, str]:
-    primary_reference = ensure_model_reference(model_cfg, base_dir=base_dir)
+def load_yolo_model(
+    model_cfg: dict[str, Any],
+    base_dir: Path | None = None,
+    progress_callback: ProgressCallback | None = None,
+) -> tuple[YOLO, str]:
+    primary_reference = ensure_model_reference(model_cfg, base_dir=base_dir, progress_callback=progress_callback)
     fallback_name = str(model_cfg.get("fallback_name", "")).strip()
     use_fallback = bool(model_cfg.get("use_fallback", False))
 
@@ -142,6 +175,8 @@ def load_yolo_model(model_cfg: dict[str, Any], base_dir: Path | None = None) -> 
     errors: list[str] = []
     for reference in candidates:
         try:
+            if progress_callback is not None:
+                progress_callback(f"Inicjalizacja YOLO: {reference}", None, None)
             model = YOLO(reference)
             persisted_reference = _persist_model_to_local_dir(
                 model_cfg=model_cfg,
@@ -149,6 +184,8 @@ def load_yolo_model(model_cfg: dict[str, Any], base_dir: Path | None = None) -> 
                 model=model,
                 base_dir=base_dir,
             )
+            if progress_callback is not None:
+                progress_callback("Model gotowy", 100, 100)
             return model, persisted_reference
         except Exception as exc:  # noqa: BLE001
             errors.append(f"{reference}: {exc}")

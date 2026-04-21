@@ -49,6 +49,7 @@ from PyQt6.QtWidgets import (
     QLineEdit,
     QMainWindow,
     QMessageBox,
+    QProgressBar,
     QPushButton,
     QScrollArea,
     QSlider,
@@ -139,7 +140,14 @@ def _lab_color_distance(color_a: tuple[int, int, int], color_b: tuple[int, int, 
     return float(np.linalg.norm(first - second))
 
 
-def _compute_region_color(frame: np.ndarray, mask: np.ndarray, y_start: int, y_end: int) -> tuple[str, int] | None:
+def _compute_region_color(
+    frame: np.ndarray,
+    mask: np.ndarray,
+    y_start: int,
+    y_end: int,
+    *,
+    center_band_fraction: float = 1.0,
+) -> tuple[str, int] | None:
     if frame.ndim != 3 or mask.ndim != 2:
         return None
     height = frame.shape[0]
@@ -150,6 +158,22 @@ def _compute_region_color(frame: np.ndarray, mask: np.ndarray, y_start: int, y_e
     region_mask = mask[y1:y2, :] > 0
     if not np.any(region_mask):
         return None
+
+    # Optionally ignore silhouette edges (hands/held objects) and sample torso/legs center band.
+    band_fraction = _clamp(float(center_band_fraction), 0.2, 1.0)
+    if band_fraction < 0.999:
+        _, xs = np.where(region_mask)
+        if xs.size >= 16:
+            side_trim = (1.0 - band_fraction) * 50.0
+            x_lo = int(np.percentile(xs, side_trim))
+            x_hi = int(np.percentile(xs, 100.0 - side_trim))
+            if x_hi > x_lo:
+                x_coords = np.arange(region_mask.shape[1], dtype=np.int32)
+                center_cols = (x_coords >= x_lo) & (x_coords <= x_hi)
+                center_mask = region_mask & center_cols[None, :]
+                if np.any(center_mask):
+                    region_mask = center_mask
+
     region_pixels = frame[y1:y2, :, :][region_mask]
     if region_pixels.size == 0:
         return None
@@ -179,6 +203,7 @@ YOLO_PROFILE_PRESETS: dict[str, dict[str, Any]] = {
         "combo_label": "Low - szybki i lekki",
         "description": "Najlepszy dla slabszego sprzetu lub wielu kamer jednoczesnie.",
         "model_name": "yolo26n.pt",
+        "day_seg_model_name": "yolo26n-seg.pt",
         "target_fps": 30.0,
         "conf": 0.24,
         "iou": 0.40,
@@ -190,6 +215,7 @@ YOLO_PROFILE_PRESETS: dict[str, dict[str, Any]] = {
         "combo_label": "Medium - balans",
         "description": "Dobry kompromis miedzy dokladnoscia i plynnoscia na przecietnym GPU.",
         "model_name": "yolo26s.pt",
+        "day_seg_model_name": "yolo26s-seg.pt",
         "target_fps": 20.0,
         "conf": 0.27,
         "iou": 0.42,
@@ -201,6 +227,7 @@ YOLO_PROFILE_PRESETS: dict[str, dict[str, Any]] = {
         "combo_label": "High - dokladnosc",
         "description": "Lepsza jakosc detekcji kosztem szybkosci, dobra dla mocniejszego sprzetu.",
         "model_name": "yolo26m.pt",
+        "day_seg_model_name": "yolo26m-seg.pt",
         "target_fps": 12.0,
         "conf": 0.30,
         "iou": 0.45,
@@ -341,6 +368,19 @@ def _infer_model_family(name: str) -> str:
     if match is not None:
         return str(match.group(1)).lower()
     return "-"
+
+
+def _parse_model_series_and_size(name: str) -> tuple[str, str]:
+    text = str(name or "").strip().lower()
+    match = re.search(r"(yolo(?:v?\d+))(?:[-_])?([nslmx])", text)
+    if match is None:
+        return "", ""
+    return str(match.group(1)), str(match.group(2))
+
+
+def _model_size_rank(size_key: str) -> int:
+    ranks = {"n": 0, "s": 1, "m": 2, "l": 3, "x": 4}
+    return int(ranks.get(str(size_key or "").strip().lower(), 99))
 
 
 def _read_model_meta(path: Path) -> dict[str, Any] | None:
@@ -988,6 +1028,62 @@ class MaskEditorWidget(QWidget):
         self.update()
 
 
+class ModelDownloadProgressDialog(QDialog):
+    def __init__(self, title: str, model_name: str, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.setModal(True)
+        self.setMinimumWidth(520)
+
+        self.status_label = QLabel(f"Przygotowanie pobierania modelu: {model_name}")
+        self.status_label.setWordWrap(True)
+
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 0)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setTextVisible(True)
+
+        self.percent_label = QLabel("Trwa pobieranie...")
+        self.percent_label.setStyleSheet("color: #bfc9da;")
+
+        self.ok_button = QPushButton("OK")
+        self.ok_button.setEnabled(False)
+        self.ok_button.clicked.connect(self.accept)
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(self.status_label)
+        layout.addWidget(self.progress_bar)
+        layout.addWidget(self.percent_label)
+        layout.addWidget(self.ok_button, alignment=Qt.AlignmentFlag.AlignRight)
+
+    def _pump_ui(self) -> None:
+        app = QApplication.instance()
+        if app is not None:
+            app.processEvents()
+
+    def update_from_progress(self, status: str, downloaded: int | None, total: int | None) -> None:
+        self.status_label.setText(str(status or "Pobieranie modelu..."))
+
+        if total is not None and total > 0 and downloaded is not None:
+            percent = int(max(0, min(100, round((float(downloaded) * 100.0) / float(total)))))
+            self.progress_bar.setRange(0, 100)
+            self.progress_bar.setValue(percent)
+            self.percent_label.setText(f"{percent}%")
+        else:
+            self.progress_bar.setRange(0, 0)
+            self.percent_label.setText("Trwa pobieranie...")
+
+        self._pump_ui()
+
+    def mark_complete(self, message: str = "Pobieranie zakonczone.") -> None:
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(100)
+        self.status_label.setText(message)
+        self.percent_label.setText("100%")
+        self.ok_button.setEnabled(True)
+        self._pump_ui()
+
+
 class UniformPreviewWidget(QWidget):
     def __init__(self) -> None:
         super().__init__()
@@ -1269,6 +1365,14 @@ class InferenceWindow(QMainWindow):
         self._infer_notices: list[str] = []
         self._infer_worker_rr_cursor = 0
         self._ignore_mask_cache: dict[str, tuple[tuple[int, int], str, np.ndarray]] = {}
+        self._uniform_track_memory: dict[str, dict[int, dict[str, Any]]] = {}
+        self._uniform_memory_decay = float(_clamp(float(self.runtime_cfg.get("uniform_memory_decay", 0.88)), 0.5, 0.99))
+        self._uniform_memory_alpha = float(_clamp(float(self.runtime_cfg.get("uniform_memory_alpha", 0.30)), 0.05, 0.95))
+        self._uniform_memory_min_worker_score = float(
+            _clamp(float(self.runtime_cfg.get("uniform_memory_min_worker_score", 0.55)), 0.2, 0.95)
+        )
+        self._uniform_memory_max_bad_streak = max(1, int(self.runtime_cfg.get("uniform_memory_max_bad_streak", 4)))
+        self._uniform_memory_ttl_sec = max(1.0, float(self.runtime_cfg.get("uniform_memory_ttl_sec", 5.0)))
         self._event_writer_cond = threading.Condition()
         self._event_writer_queue: deque[tuple[str, int, np.ndarray]] = deque()
         self._event_writer_pending: dict[tuple[str, int], int] = {}
@@ -1609,6 +1713,29 @@ class InferenceWindow(QMainWindow):
             f"compile_requested={self.compile_requested} compile_status={self._compile_status_text()} | "
             f"day_seg={self.day_seg_model_reference or '-'}"
         )
+
+    def _load_model_with_progress_dialog(
+        self,
+        model_cfg: dict[str, Any],
+        *,
+        dialog_title: str,
+        model_name: str,
+    ) -> tuple[YOLO, str]:
+        dialog = ModelDownloadProgressDialog(dialog_title, model_name, self)
+        dialog.show()
+        dialog.update_from_progress("Start pobierania...", 0, None)
+
+        def _progress_cb(status: str, downloaded: int | None, total: int | None) -> None:
+            dialog.update_from_progress(status, downloaded, total)
+
+        try:
+            model, reference = load_yolo_model(model_cfg, base_dir=Path.cwd(), progress_callback=_progress_cb)
+            dialog.mark_complete("Model pobrany i gotowy do uzycia.")
+            dialog.exec()
+            return model, reference
+        except Exception:
+            dialog.reject()
+            raise
 
     def _preflight_compile_predict(self) -> None:
         if self.model is None or not self.compile_enabled:
@@ -3103,6 +3230,9 @@ class InferenceWindow(QMainWindow):
     def _apply_yolo_profile_to_controls(self, profile_key: str) -> None:
         preset = YOLO_PROFILE_PRESETS.get(profile_key, YOLO_PROFILE_PRESETS["medium"])
         self._set_model_combo_value({"model_name": str(preset["model_name"]), "selected_model_path": ""})
+        self._set_day_seg_model_combo_value(
+            {"model_name": str(preset.get("day_seg_model_name", DEFAULT_DAY_SEG_MODEL_NAME)), "selected_model_path": ""}
+        )
         self.model_target_fps_spin.setValue(int(round(float(preset["target_fps"]))))
         self.conf_spin.setValue(float(preset["conf"]))
         self.iou_spin.setValue(float(preset["iou"]))
@@ -3122,7 +3252,8 @@ class InferenceWindow(QMainWindow):
             )
         else:
             self.yolo_profile_help_label.setText(
-                f"{preset['title']}: {preset['description']} Domyslny model: {preset['model_name']}."
+                f"{preset['title']}: {preset['description']} Domyslny model: {preset['model_name']}, "
+                f"segm: {preset.get('day_seg_model_name', DEFAULT_DAY_SEG_MODEL_NAME)}."
             )
         current_model_name = self._current_yolo_model_selection()["model_name"]
         day_seg_model_name = self._current_day_seg_model_selection()["model_name"]
@@ -3223,6 +3354,30 @@ class InferenceWindow(QMainWindow):
         self.runtime_cfg["yolo_profile"] = profile_key
         self.model_cfg["name"] = str(preset["model_name"])
         self.model_cfg["selected_model_path"] = ""
+        day_seg_cfg = self._day_segmentation_model_cfg()
+        day_seg_cfg["name"] = str(preset.get("day_seg_model_name", DEFAULT_DAY_SEG_MODEL_NAME))
+        day_seg_cfg["selected_model_path"] = ""
+        self.model_cfg["day_segmentation"] = dict(day_seg_cfg)
+
+        if not self._ensure_configured_model_available(segmentation=False):
+            self._update_yolo_profile_summary()
+            return
+        if not self._ensure_configured_model_available(segmentation=True):
+            self._update_yolo_profile_summary()
+            return
+
+        self._suppress_setting_autosave = True
+        try:
+            self._set_model_combo_value(
+                {
+                    "model_name": str(self.model_cfg.get("name", "")).strip(),
+                    "selected_model_path": str(self.model_cfg.get("selected_model_path", "")).strip(),
+                }
+            )
+            self._set_day_seg_model_combo_value(self._day_segmentation_model_cfg())
+        finally:
+            self._suppress_setting_autosave = False
+
         self._update_yolo_profile_summary()
         self._on_setting_changed()
 
@@ -3251,6 +3406,216 @@ class InferenceWindow(QMainWindow):
 
         if was_running:
             self.start_live()
+
+    def _find_model_catalog_entry(
+        self,
+        selection: dict[str, str],
+        *,
+        segmentation: bool,
+    ) -> dict[str, Any] | None:
+        target_name = str(selection.get("model_name", "")).strip().lower()
+        target_path = str(selection.get("selected_model_path", "")).strip()
+        resolved_target_path = ""
+        if target_path:
+            try:
+                resolved_target_path = str(resolve_path(target_path).resolve())
+            except Exception:  # noqa: BLE001
+                resolved_target_path = target_path
+
+        for entry in self.model_catalog:
+            if self._entry_is_segmentation_model(entry) != segmentation:
+                continue
+            entry_path = str(Path(entry["path"]).resolve())
+            entry_name = str(entry.get("model_name", entry.get("name", ""))).strip().lower()
+            if resolved_target_path and entry_path == resolved_target_path:
+                return entry
+            if target_name and entry_name == target_name:
+                return entry
+        return None
+
+    def _closest_available_model_entry(self, target_model_name: str, *, segmentation: bool) -> dict[str, Any] | None:
+        available_entries = [
+            entry
+            for entry in self.model_catalog
+            if self._entry_is_segmentation_model(entry) == segmentation and not bool(entry.get("missing", False))
+        ]
+        if not available_entries:
+            return None
+
+        target_series, target_size = _parse_model_series_and_size(target_model_name)
+        target_size_rank = _model_size_rank(target_size)
+
+        def _score(entry: dict[str, Any]) -> tuple[int, int, tuple[tuple[int, int], int, int, int, float, str]]:
+            entry_model_name = str(entry.get("model_name", entry.get("name", ""))).strip()
+            entry_series, entry_size = _parse_model_series_and_size(entry_model_name)
+            entry_size_rank = _model_size_rank(entry_size)
+
+            series_penalty = 0
+            if target_series and entry_series != target_series:
+                series_penalty = 100
+
+            size_penalty = 50
+            if target_size_rank < 99 and entry_size_rank < 99:
+                size_penalty = abs(entry_size_rank - target_size_rank)
+
+            return (series_penalty, size_penalty, self._model_catalog_sort_key(entry))
+
+        return min(available_entries, key=_score)
+
+    def _restore_loaded_model_selection(self, *, segmentation: bool) -> None:
+        self._suppress_setting_autosave = True
+        try:
+            if segmentation:
+                seg_cfg = self._day_segmentation_model_cfg()
+                if self.current_day_seg_model_path is not None and self.current_day_seg_model_path.exists():
+                    seg_cfg["selected_model_path"] = _to_relative_or_abs(self.current_day_seg_model_path)
+                    seg_cfg["name"] = self.current_day_seg_model_path.name
+                elif self.day_seg_model_reference:
+                    seg_cfg["selected_model_path"] = ""
+                    seg_cfg["name"] = Path(str(self.day_seg_model_reference)).name
+                self.model_cfg["day_segmentation"] = dict(seg_cfg)
+                self._populate_day_seg_model_combo()
+                self._set_day_seg_model_combo_value(self.model_cfg["day_segmentation"])
+                return
+
+            if self.current_model_path is not None and self.current_model_path.exists():
+                self.model_cfg["selected_model_path"] = _to_relative_or_abs(self.current_model_path)
+                self.model_cfg["name"] = self.current_model_path.name
+            elif self.model_reference:
+                self.model_cfg["selected_model_path"] = ""
+                self.model_cfg["name"] = Path(str(self.model_reference)).name
+            self._populate_yolo_model_combo()
+            self._set_model_combo_value(
+                {
+                    "model_name": str(self.model_cfg.get("name", "")),
+                    "selected_model_path": str(self.model_cfg.get("selected_model_path", "")).strip(),
+                }
+            )
+        finally:
+            self._suppress_setting_autosave = False
+
+    def _ensure_configured_model_available(self, *, segmentation: bool) -> bool:
+        if segmentation:
+            target_cfg = self._day_segmentation_model_cfg()
+            selection = {
+                "model_name": str(target_cfg.get("name", DEFAULT_DAY_SEG_MODEL_NAME)).strip(),
+                "selected_model_path": str(target_cfg.get("selected_model_path", "")).strip(),
+            }
+            dialog_title = "Model segmentacji"
+        else:
+            target_cfg = dict(self.model_cfg)
+            selection = {
+                "model_name": str(target_cfg.get("name", "")).strip(),
+                "selected_model_path": str(target_cfg.get("selected_model_path", "")).strip(),
+            }
+            dialog_title = "Model"
+
+        selected_path = str(selection.get("selected_model_path", "")).strip()
+        if selected_path:
+            try:
+                if resolve_path(selected_path).exists():
+                    return True
+            except Exception:  # noqa: BLE001
+                pass
+
+        entry = self._find_model_catalog_entry(selection, segmentation=segmentation)
+        if entry is not None and not bool(entry.get("missing", False)):
+            return True
+
+        model_name = str(selection.get("model_name", "")).strip() or (
+            DEFAULT_DAY_SEG_MODEL_NAME if segmentation else str(self.model_cfg.get("name", ""))
+        )
+        reply = QMessageBox.question(
+            self,
+            dialog_title,
+            f"Model {model_name} nie istnieje lokalnie. Pobierac teraz?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            fallback_entry = self._closest_available_model_entry(model_name, segmentation=segmentation)
+            if fallback_entry is None:
+                self._restore_loaded_model_selection(segmentation=segmentation)
+                self._update_yolo_profile_summary()
+                return False
+
+            fallback_path = Path(fallback_entry["path"])
+            fallback_selection = {
+                "model_name": str(fallback_entry.get("model_name", fallback_entry.get("name", ""))).strip(),
+                "selected_model_path": _to_relative_or_abs(fallback_path),
+            }
+
+            if segmentation:
+                day_seg_cfg = self._day_segmentation_model_cfg()
+                day_seg_cfg["name"] = fallback_selection["model_name"]
+                day_seg_cfg["selected_model_path"] = fallback_selection["selected_model_path"]
+                self.model_cfg["day_segmentation"] = dict(day_seg_cfg)
+                self._suppress_setting_autosave = True
+                try:
+                    self._set_day_seg_model_combo_value(fallback_selection)
+                finally:
+                    self._suppress_setting_autosave = False
+            else:
+                self.model_cfg["name"] = fallback_selection["model_name"]
+                self.model_cfg["selected_model_path"] = fallback_selection["selected_model_path"]
+                self._suppress_setting_autosave = True
+                try:
+                    self._set_model_combo_value(fallback_selection)
+                finally:
+                    self._suppress_setting_autosave = False
+
+            QMessageBox.information(
+                self,
+                dialog_title,
+                "Wybrany model nie zostal pobrany. "
+                f"Ustawiono najblizszy dostepny model: {fallback_selection['model_name']}."
+            )
+            self._update_yolo_profile_summary()
+            return True
+
+        try:
+            download_cfg = dict(target_cfg)
+            download_cfg["name"] = model_name
+            download_cfg["selected_model_path"] = ""
+            model, reference = self._load_model_with_progress_dialog(
+                download_cfg,
+                dialog_title=dialog_title,
+                model_name=model_name,
+            )
+            del model
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.critical(self, dialog_title, f"Nie mozna pobrac modelu:\n{exc}")
+            self._restore_loaded_model_selection(segmentation=segmentation)
+            self._update_yolo_profile_summary()
+            return False
+
+        resolved_reference = Path(reference)
+        if resolved_reference.exists():
+            download_cfg["selected_model_path"] = _to_relative_or_abs(resolved_reference.resolve())
+
+        if segmentation:
+            self.model_cfg["day_segmentation"] = dict(download_cfg)
+        else:
+            self.model_cfg.update(download_cfg)
+
+        self._refresh_model_catalog()
+        self._suppress_setting_autosave = True
+        try:
+            if segmentation:
+                self._populate_day_seg_model_combo()
+                self._set_day_seg_model_combo_value(self.model_cfg["day_segmentation"])
+            else:
+                self._populate_yolo_model_combo()
+                self._set_model_combo_value(
+                    {
+                        "model_name": str(self.model_cfg.get("name", "")),
+                        "selected_model_path": str(self.model_cfg.get("selected_model_path", "")).strip(),
+                    }
+                )
+        finally:
+            self._suppress_setting_autosave = False
+        self._update_yolo_profile_summary()
+        return True
 
     def _model_config_requires_reload(self) -> bool:
         desired_path_raw = str(self.model_cfg.get("selected_model_path", "")).strip()
@@ -3415,8 +3780,14 @@ class InferenceWindow(QMainWindow):
             self.settings_unsaved_label.setVisible(False)
 
     def _confirm_and_save_settings(self) -> None:
-        self._commit_pending_settings()
-        self._clear_settings_dirty()
+        if self._commit_pending_settings():
+            self._clear_settings_dirty()
+        else:
+            QMessageBox.warning(
+                self,
+                "Ustawienia",
+                "Nie udalo sie zapisac ustawien. Sprawdz komunikaty o modelach i sprobuj ponownie.",
+            )
 
     def _discard_pending_settings(self) -> None:
         self._suppress_setting_autosave = True
@@ -3563,10 +3934,18 @@ class InferenceWindow(QMainWindow):
         finally:
             self._suppress_setting_autosave = False
 
-        self._commit_pending_settings()
-        self._clear_settings_dirty()
-        self._log(f"Preset wczytany i aktywowany: {selected_file}")
-        QMessageBox.information(self, "Preset", f"Wczytano preset:\n{selected_file}")
+        if self._commit_pending_settings():
+            self._clear_settings_dirty()
+            self._log(f"Preset wczytany i aktywowany: {selected_file}")
+            QMessageBox.information(self, "Preset", f"Wczytano preset:\n{selected_file}")
+        else:
+            self._log(f"[warn] Wczytano preset, ale nie udalo sie zapisac zmian: {selected_file}")
+            QMessageBox.warning(
+                self,
+                "Preset",
+                "Preset zostal wczytany do formularza, ale zapis nie powiodl sie. "
+                "Sprawdz komunikaty o modelach i zapisz ponownie.",
+            )
 
     def _on_main_tab_changed(self, index: int) -> None:
         if self._suppress_main_tab_change_handler:
@@ -3605,18 +3984,23 @@ class InferenceWindow(QMainWindow):
 
         self._last_main_tab_index = index
 
-    def _commit_pending_settings(self) -> None:
+    def _commit_pending_settings(self) -> bool:
         previous_settings = self._snapshot_settings_state()
         self._apply_controls_to_runtime_state()
         ensure_windows_compile_env(self.inference_cfg, compile_value=self.inference_cfg.get("compile", False))
         if self._model_config_requires_reload():
+            if not self._ensure_configured_model_available(segmentation=False):
+                return False
+            if self._uniform_detection_enabled() and not self._ensure_configured_model_available(segmentation=True):
+                return False
             try:
                 self._reload_model_from_config()
             except Exception:  # noqa: BLE001
-                return
+                return False
         self._rebuild_predict_kwargs()
         self._update_yolo_profile_summary()
         self._persist_config(show_message=False, previous_settings=previous_settings)
+        return True
 
     def _flush_pending_settings(self) -> None:
         if self._settings_save_timer.isActive():
@@ -3959,6 +4343,9 @@ class InferenceWindow(QMainWindow):
             preset_model_name = str((preset or {}).get("model_name", "")).strip()
             if preset_model_name:
                 suggested_names_set.add(preset_model_name)
+            preset_day_seg_name = str((preset or {}).get("day_seg_model_name", "")).strip()
+            if preset_day_seg_name:
+                suggested_names_set.add(preset_day_seg_name)
 
         selected_model_name = str(self.model_cfg.get("name", "")).strip()
         if selected_model_name:
@@ -4157,7 +4544,11 @@ class InferenceWindow(QMainWindow):
                 if reply != QMessageBox.StandardButton.Yes:
                     return
                 try:
-                    model, reference = load_yolo_model(seg_cfg, base_dir=Path.cwd())
+                    model, reference = self._load_model_with_progress_dialog(
+                        seg_cfg,
+                        dialog_title="Model segmentacji",
+                        model_name=model_name or model_path.name,
+                    )
                     del model
                     resolved_reference = Path(reference)
                     if resolved_reference.exists():
@@ -4210,7 +4601,11 @@ class InferenceWindow(QMainWindow):
                     "name", ""
                 )
                 self.model_cfg["selected_model_path"] = ""
-                self.model, reference = load_yolo_model(self.model_cfg, base_dir=Path.cwd())
+                self.model, reference = self._load_model_with_progress_dialog(
+                    self.model_cfg,
+                    dialog_title="Model",
+                    model_name=str(self.model_cfg.get("name", "")).strip() or str(entry.get("model_name", "model")),
+                )
                 model_path = Path(reference) if reference and Path(reference).exists() else model_path
             else:
                 self.model = YOLO(str(model_path))
@@ -4281,7 +4676,11 @@ class InferenceWindow(QMainWindow):
             target_cfg = dict(self._day_segmentation_model_cfg()) if self._entry_is_segmentation_model(entry) else dict(self.model_cfg)
             target_cfg["name"] = model_name or str(target_cfg.get("name", "")).strip()
             target_cfg["selected_model_path"] = ""
-            model, reference = load_yolo_model(target_cfg, base_dir=Path.cwd())
+            model, reference = self._load_model_with_progress_dialog(
+                target_cfg,
+                dialog_title="Model segmentacji" if self._entry_is_segmentation_model(entry) else "Model",
+                model_name=model_name,
+            )
             del model
         except Exception as exc:  # noqa: BLE001
             QMessageBox.critical(self, "Model", f"Nie mozna pobrac modelu:\n{exc}")
@@ -4316,7 +4715,11 @@ class InferenceWindow(QMainWindow):
             return
 
         try:
-            model, reference = load_yolo_model(seg_cfg, base_dir=Path.cwd())
+            model, reference = self._load_model_with_progress_dialog(
+                seg_cfg,
+                dialog_title="Model segmentacji",
+                model_name=model_name,
+            )
             del model
         except Exception as exc:  # noqa: BLE001
             QMessageBox.critical(self, "Model segmentacji", f"Nie mozna pobrac modelu segmentacji:\n{exc}")
@@ -4462,7 +4865,7 @@ class InferenceWindow(QMainWindow):
             overlay = {}
         if not isinstance(overlay, dict):
             return
-        for key in ("model", "inference", "tracker", "security", "events", "runtime"):
+        for key in ("model", "inference", "tracker", "security", "uniform", "events", "runtime"):
             if key in overlay:
                 self.config[key] = overlay.get(key)
 
@@ -5449,6 +5852,7 @@ class InferenceWindow(QMainWindow):
             self._infer_pending_frames.pop(source_name, None)
             self._infer_results.pop(source_name, None)
             self._infer_last_submit_ts.pop(source_name, None)
+            self._uniform_track_memory.pop(source_name, None)
 
     def _enqueue_inference_frame(self, source_name: str, frame: np.ndarray, submit_ts: float) -> None:
         frame_to_infer = frame
@@ -5557,7 +5961,8 @@ class InferenceWindow(QMainWindow):
                 source_name = source_batch[idx]
                 frame = frame_batch[idx]
                 result = batch_results[idx]
-                boxes, person_count, intruder_count = self._extract_mode_detections(source_name, None, result, frame, mode)
+                runtime = self.runtimes.get(source_name)
+                boxes, person_count, intruder_count = self._extract_mode_detections(source_name, runtime, result, frame, mode)
                 alert_value = intruder_count if mode == "day" else person_count
                 alert = should_raise_alert(alert_value, mode, self.security_cfg)
                 payload = AsyncInferenceResult(
@@ -5833,6 +6238,7 @@ class InferenceWindow(QMainWindow):
     def _reset_tracker_for_source(self, source_name: str, runtime: SourceRuntime | None = None) -> None:
         with self._infer_lock:
             self.trackers.pop(source_name, None)
+            self._uniform_track_memory.pop(source_name, None)
         if not self.tracker_enabled or self.byte_tracker_cls is None:
             return
 
@@ -6073,6 +6479,7 @@ class InferenceWindow(QMainWindow):
 
         tolerance = float(self.uniform_cfg.get("color_tolerance", UNIFORM_COLOR_TOLERANCE_DEFAULT))
         min_pixels = max(20, int(self.uniform_cfg.get("min_mask_pixels", UNIFORM_MIN_MASK_PIXELS_DEFAULT)))
+        center_band_fraction = _clamp(float(self.uniform_cfg.get("center_band_fraction", 0.6)), 0.3, 1.0)
         target_upper_hex = _normalize_hex_color(self.uniform_cfg.get("top_color", UNIFORM_TOP_DEFAULT), UNIFORM_TOP_DEFAULT)
         target_lower_hex = _normalize_hex_color(self.uniform_cfg.get("bottom_color", UNIFORM_BOTTOM_DEFAULT), UNIFORM_BOTTOM_DEFAULT)
         target_upper_bgr = _hex_to_bgr(target_upper_hex)
@@ -6083,33 +6490,65 @@ class InferenceWindow(QMainWindow):
         for detection, seg_mask in candidates:
             working_mask = seg_mask
             if working_mask is None:
-                working_mask = np.zeros((frame_h, frame_w), dtype=np.uint8)
-                working_mask[max(0, detection.y1):min(frame_h, detection.y2), max(0, detection.x1):min(frame_w, detection.x2)] = 255
                 detection.has_segmentation = False
-            else:
-                if working_mask.shape[0] != frame_h or working_mask.shape[1] != frame_w:
-                    try:
-                        working_mask = cv2.resize(working_mask, (frame_w, frame_h), interpolation=cv2.INTER_NEAREST)
-                    except Exception:  # noqa: BLE001
-                        working_mask = None
-                detection.has_segmentation = working_mask is not None
-
-            if working_mask is None:
+                detection.upper_match = False
+                detection.lower_match = False
+                detection.uniform_match = False
+                detection.is_intruder = True
+                detection.label = "intruz"
                 detections.append(detection)
                 continue
 
-            person_height = max(1, detection.y2 - detection.y1)
+            if working_mask.shape[0] != frame_h or working_mask.shape[1] != frame_w:
+                try:
+                    working_mask = cv2.resize(working_mask, (frame_w, frame_h), interpolation=cv2.INTER_NEAREST)
+                except Exception:  # noqa: BLE001
+                    working_mask = None
+            detection.has_segmentation = working_mask is not None
+
+            if working_mask is None:
+                detection.upper_match = False
+                detection.lower_match = False
+                detection.uniform_match = False
+                detection.is_intruder = True
+                detection.label = "intruz"
+                detections.append(detection)
+                continue
+
+            mask_rows = np.where(working_mask > 0)[0]
+            if mask_rows.size == 0:
+                detection.has_segmentation = False
+                detection.upper_match = False
+                detection.lower_match = False
+                detection.uniform_match = False
+                detection.is_intruder = True
+                detection.label = "intruz"
+                detections.append(detection)
+                continue
+
+            # Split body using segmentation mask geometry, not bbox height.
+            upper_start = int(np.percentile(mask_rows, 20))
+            upper_end = int(np.percentile(mask_rows, 60))
+            lower_start = int(np.percentile(mask_rows, 60))
+            lower_end = int(np.percentile(mask_rows, 95)) + 1
+
+            upper_end = max(upper_start + 1, upper_end)
+            lower_start = max(upper_end, lower_start)
+            lower_end = max(lower_start + 1, lower_end)
+
             upper_sample = _compute_region_color(
                 frame,
                 working_mask,
-                detection.y1 + int(person_height * 0.18),
-                detection.y1 + int(person_height * 0.58),
+                upper_start,
+                upper_end,
+                center_band_fraction=center_band_fraction,
             )
             lower_sample = _compute_region_color(
                 frame,
                 working_mask,
-                detection.y1 + int(person_height * 0.55),
-                detection.y1 + int(person_height * 0.98),
+                lower_start,
+                lower_end,
+                center_band_fraction=center_band_fraction,
             )
 
             upper_match: bool | None = None
@@ -6127,7 +6566,7 @@ class InferenceWindow(QMainWindow):
             detection.lower_match = lower_match
             detection.uniform_match = (upper_match is not False) and (lower_match is not False)
             detection.is_intruder = bool(upper_match is False or lower_match is False)
-            detection.label = "intruder" if detection.is_intruder else "worker"
+            detection.label = "intruz" if detection.is_intruder else "pracownik"
             detections.append(detection)
 
         return detections
@@ -6205,6 +6644,113 @@ class InferenceWindow(QMainWindow):
             )
         return boxes
 
+    def _bbox_iou(self, first: PersonDetection, second: PersonDetection) -> float:
+        inter_x1 = max(first.x1, second.x1)
+        inter_y1 = max(first.y1, second.y1)
+        inter_x2 = min(first.x2, second.x2)
+        inter_y2 = min(first.y2, second.y2)
+        if inter_x2 <= inter_x1 or inter_y2 <= inter_y1:
+            return 0.0
+
+        inter_area = float((inter_x2 - inter_x1) * (inter_y2 - inter_y1))
+        first_area = float(max(1, first.x2 - first.x1) * max(1, first.y2 - first.y1))
+        second_area = float(max(1, second.x2 - second.x1) * max(1, second.y2 - second.y1))
+        union = first_area + second_area - inter_area
+        if union <= 1e-6:
+            return 0.0
+        return inter_area / union
+
+    def _attach_track_ids_to_day_detections(
+        self,
+        detections: list[PersonDetection],
+        tracked_boxes: list[PersonDetection],
+    ) -> None:
+        if not detections or not tracked_boxes:
+            return
+
+        used_tracked: set[int] = set()
+        for detection in sorted(detections, key=lambda item: float(item.conf), reverse=True):
+            best_index = -1
+            best_iou = 0.0
+            for index, tracked in enumerate(tracked_boxes):
+                if index in used_tracked:
+                    continue
+                score = self._bbox_iou(detection, tracked)
+                if score > best_iou:
+                    best_iou = score
+                    best_index = index
+
+            if best_index < 0 or best_iou < 0.15:
+                continue
+
+            tracked = tracked_boxes[best_index]
+            detection.track_id = tracked.track_id
+            detection.conf = max(float(detection.conf), float(tracked.conf))
+            used_tracked.add(best_index)
+
+    def _apply_uniform_temporal_memory(self, source_name: str, detections: list[PersonDetection]) -> None:
+        now_ts = time.perf_counter()
+        with self._infer_lock:
+            source_memory = self._uniform_track_memory.setdefault(source_name, {})
+
+            for track_id in list(source_memory.keys()):
+                last_seen = float(source_memory[track_id].get("last_seen_ts", 0.0))
+                if (now_ts - last_seen) > self._uniform_memory_ttl_sec:
+                    del source_memory[track_id]
+
+            for detection in detections:
+                if detection.track_id is None:
+                    continue
+
+                track_id = int(detection.track_id)
+                entry = source_memory.get(track_id, {})
+                previous_score = float(entry.get("score", 0.0))
+                bad_streak = int(entry.get("bad_streak", 0))
+
+                false_count = int(detection.upper_match is False) + int(detection.lower_match is False)
+                true_count = int(detection.upper_match is True) + int(detection.lower_match is True)
+                unknown_count = 2 - false_count - true_count
+
+                if false_count > 0:
+                    vote = -1.0
+                elif true_count == 2:
+                    vote = 1.0
+                elif true_count == 1 and unknown_count == 1:
+                    vote = 0.45
+                else:
+                    vote = 0.10
+
+                decayed = previous_score * self._uniform_memory_decay
+                score = ((1.0 - self._uniform_memory_alpha) * decayed) + (self._uniform_memory_alpha * vote)
+                score = float(_clamp(score, -1.0, 1.0))
+
+                current_intruder = bool(detection.is_intruder)
+                bad_streak = bad_streak + 1 if current_intruder else 0
+
+                strong_worker_history = score >= self._uniform_memory_min_worker_score
+                if current_intruder and strong_worker_history:
+                    keep_as_worker = False
+                    if false_count <= 1 and bad_streak <= self._uniform_memory_max_bad_streak:
+                        keep_as_worker = True
+                    elif false_count == 2 and bad_streak <= 1 and float(detection.conf) < 0.90:
+                        keep_as_worker = True
+
+                    if keep_as_worker:
+                        detection.is_intruder = False
+                        detection.uniform_match = True
+                        detection.label = "pracownik"
+
+                if detection.is_intruder:
+                    detection.label = "intruz"
+                else:
+                    detection.label = "pracownik"
+
+                source_memory[track_id] = {
+                    "score": score,
+                    "bad_streak": bad_streak,
+                    "last_seen_ts": now_ts,
+                }
+
     def _extract_mode_detections(
         self,
         source_name: str,
@@ -6215,8 +6761,14 @@ class InferenceWindow(QMainWindow):
     ) -> tuple[list[PersonDetection], int, int]:
         if mode == "day" and self._uniform_detection_enabled():
             detections = self._analyze_day_uniform_detections(frame, result)
+            tracked_boxes = self._extract_tracked_person_boxes(source_name, runtime, result, frame)
+            self._attach_track_ids_to_day_detections(detections, tracked_boxes)
+            self._apply_uniform_temporal_memory(source_name, detections)
+
+            tracked_ids = {detection.track_id for detection in detections if detection.track_id is not None}
+            person_count = len(tracked_ids) if tracked_ids else len(detections)
             intruder_count = sum(1 for detection in detections if detection.is_intruder)
-            return detections, len(detections), intruder_count
+            return detections, person_count, intruder_count
 
         detections = self._extract_tracked_person_boxes(source_name, runtime, result, frame)
         tracked_ids = {detection.track_id for detection in detections if detection.track_id is not None}
@@ -6225,7 +6777,7 @@ class InferenceWindow(QMainWindow):
         for detection in detections:
             detection.is_intruder = mode == "night" or not self._uniform_detection_enabled()
             detection.uniform_match = None
-            detection.label = "intruder" if detection.is_intruder else "person"
+            detection.label = "intruz" if detection.is_intruder else "pracownik"
         return detections, person_count, intruder_count
 
     def _draw_person_boxes(
@@ -6499,6 +7051,7 @@ class InferenceWindow(QMainWindow):
         with self._infer_lock:
             self.trackers.clear()
             self._infer_last_submit_ts.clear()
+            self._uniform_track_memory.clear()
 
         self._log("Live inference stopped.")
 
@@ -7724,12 +8277,6 @@ class InferenceWindow(QMainWindow):
                 self._save_event_entries_index()
             if hasattr(self, "events_table"):
                 self._refresh_events_table()
-
-        if self.current_model_path is not None and self.current_model_path.exists():
-            self.model_cfg["selected_model_path"] = _to_relative_or_abs(self.current_model_path)
-        if self.current_day_seg_model_path is not None and self.current_day_seg_model_path.exists():
-            self.model_cfg["day_segmentation"] = dict(self.model_cfg.get("day_segmentation", {}) or {})
-            self.model_cfg["day_segmentation"]["selected_model_path"] = _to_relative_or_abs(self.current_day_seg_model_path)
 
     def _persist_config(
         self,
