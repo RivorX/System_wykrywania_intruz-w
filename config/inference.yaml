@@ -37,7 +37,7 @@ inference:
   - 0
   device: '0'
   half: true
-  compile: true
+  compile: false
   fix_unicode_cache_paths: true
   cache_root_dir: C:/torch_cache
 
@@ -45,6 +45,7 @@ inference:
 # ------------------------------------------------------------
 tracker:
   enabled: true
+  backend: botsort
   frame_rate: 30
   track_high_thresh: 0.5
   track_low_thresh: 0.1
@@ -52,6 +53,10 @@ tracker:
   track_buffer: 15
   match_thresh: 0.8
   fuse_score: false
+  proximity_thresh: 0.5
+  appearance_thresh: 0.25
+  with_reid: false
+  gmc_method: none
 
 # === SECURITY ===
 # ------------------------------------------------------------
@@ -68,8 +73,8 @@ uniform:
   enabled: true
   top_color: "#2F5FA8"
   bottom_color: "#1F2430"
-  color_tolerance: 42.0
-  min_mask_pixels: 180
+  color_tolerance: 55.0
+  min_mask_pixels: 50
 
 # === EVENTS ===
 # ------------------------------------------------------------
@@ -103,10 +108,22 @@ runtime:
   view_fps_smoothing: 0.2
   view_cap_to_source_fps: true
   video_fps_fallback: 25.0
-  model_target_fps: 30.0
-  max_infer_per_tick: 2
+  model_target_fps: 24.0
+  max_infer_per_tick: 6
+  infer_batch_coalesce_ms: 5.0
+  uniform_recheck_interval_sec: 1.0
+  uniform_recheck_iou: 0.80
+  uniform_max_fresh_per_cycle: 1
   capture_buffer_size: 1
   camera_width: 1280
   camera_height: 720
   camera_fps: 30
   live_tile_spacing: 3
+
+# === DEBUG ===
+# ------------------------------------------------------------
+debug:
+  enabled: true
+  console: true
+  profiling: true
+  profile_interval_sec: 5.0

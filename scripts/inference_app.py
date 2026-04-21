@@ -106,6 +106,7 @@ class PersonDetection:
     lower_color_hex: str = ""
     has_segmentation: bool = False
     label: str = ""
+    visible_section_count: int = 0
 
 
 def _normalize_hex_color(value: Any, fallback: str) -> str:
@@ -180,6 +181,70 @@ def _compute_region_color(
     median_color = np.median(region_pixels, axis=0)
     color = tuple(int(max(0, min(255, round(float(channel))))) for channel in median_color)
     return _bgr_to_hex(color), int(region_pixels.shape[0])
+
+
+def _clip_box_to_frame(
+    x1: int,
+    y1: int,
+    x2: int,
+    y2: int,
+    frame_shape: tuple[int, ...],
+) -> tuple[int, int, int, int] | None:
+    if len(frame_shape) < 2:
+        return None
+    frame_h = int(frame_shape[0])
+    frame_w = int(frame_shape[1])
+    left = max(0, min(frame_w, int(x1)))
+    top = max(0, min(frame_h, int(y1)))
+    right = max(left, min(frame_w, int(x2)))
+    bottom = max(top, min(frame_h, int(y2)))
+    if right <= left or bottom <= top:
+        return None
+    return left, top, right, bottom
+
+
+def _extract_mask_roi_for_detection(
+    seg_mask: np.ndarray | None,
+    detection: PersonDetection,
+    frame_shape: tuple[int, ...],
+) -> tuple[np.ndarray, tuple[int, int, int, int]] | None:
+    if seg_mask is None or getattr(seg_mask, "ndim", 0) != 2:
+        return None
+
+    clipped = _clip_box_to_frame(detection.x1, detection.y1, detection.x2, detection.y2, frame_shape)
+    if clipped is None:
+        return None
+    x1, y1, x2, y2 = clipped
+
+    mask_h, mask_w = seg_mask.shape[:2]
+    frame_h = max(1, int(frame_shape[0]))
+    frame_w = max(1, int(frame_shape[1]))
+    scale_x = float(mask_w) / float(frame_w)
+    scale_y = float(mask_h) / float(frame_h)
+
+    mx1 = max(0, min(mask_w, int(math.floor(x1 * scale_x))))
+    my1 = max(0, min(mask_h, int(math.floor(y1 * scale_y))))
+    mx2 = max(mx1 + 1, min(mask_w, int(math.ceil(x2 * scale_x))))
+    my2 = max(my1 + 1, min(mask_h, int(math.ceil(y2 * scale_y))))
+    if mx2 <= mx1 or my2 <= my1:
+        return None
+
+    roi_mask = seg_mask[my1:my2, mx1:mx2]
+    if roi_mask.size == 0:
+        return None
+
+    target_w = max(1, x2 - x1)
+    target_h = max(1, y2 - y1)
+    if roi_mask.shape[1] != target_w or roi_mask.shape[0] != target_h:
+        try:
+            roi_mask = cv2.resize(roi_mask, (target_w, target_h), interpolation=cv2.INTER_NEAREST)
+        except Exception:  # noqa: BLE001
+            return None
+
+    roi_mask = np.ascontiguousarray((roi_mask > 0).astype(np.uint8) * 255)
+    if not np.any(roi_mask):
+        return None
+    return roi_mask, clipped
 
 
 def _build_day_segmentation_cfg(model_cfg: dict[str, Any]) -> dict[str, Any]:
@@ -343,16 +408,20 @@ def _configure_opencv_logging(*, silent: bool) -> None:
         pass
 
 
-def _resolve_bytetrack_backend() -> tuple[type[Any] | None, str | None]:
+def _resolve_tracker_backend(backend_name: str) -> tuple[type[Any] | None, str | None]:
     if importlib.util.find_spec("lap") is None:
         return None, "missing dependency 'lap' in active environment"
 
+    normalized = str(backend_name or "bytetrack").strip().lower()
     try:
-        from ultralytics.trackers.byte_tracker import BYTETracker as byte_tracker_cls
+        if normalized == "botsort":
+            from ultralytics.trackers.bot_sort import BOTSORT as tracker_cls
+        else:
+            from ultralytics.trackers.byte_tracker import BYTETracker as tracker_cls
     except Exception as exc:  # noqa: BLE001
         return None, str(exc)
 
-    return byte_tracker_cls, None
+    return tracker_cls, None
 
 
 def _extract_run_name_from_weight_filename(filename: str) -> str | None:
@@ -539,6 +608,7 @@ class SourceRuntime:
     alert: bool = False
     mode: str = "day"
     last_boxes: list[PersonDetection] | None = None
+    last_tracked_boxes: list[PersonDetection] | None = None
     last_input: np.ndarray | None = None
     last_output: np.ndarray | None = None
     capture_reader_thread: threading.Thread | None = None
@@ -562,6 +632,7 @@ class SourceRuntime:
     event_clip_frames_written: int = 0
     event_clip_generation: int = 0
     event_clip_failed: bool = False
+    last_tracker_update_ts: float = 0.0
 
     def release(self) -> None:
         if self.capture_reader_stop_event is not None:
@@ -580,6 +651,8 @@ class SourceRuntime:
         self.capture_reader_thread = None
         self.capture_reader_stop_event = None
         self.last_input = None
+        self.last_tracked_boxes = None
+        self.last_tracker_update_ts = 0.0
         self.capture_latest_frame = None
         self.capture_latest_seq = 0
         self.capture_last_consumed_seq = 0
@@ -1305,19 +1378,30 @@ class InferenceWindow(QMainWindow):
         self.runtime_cfg = dict(self.config.get("runtime", {}) or {})
         self.tracker_cfg = dict(self.config.get("tracker", {}) or {})
         self.events_cfg = dict(self.config.get("events", {}) or {})
+        self.debug_cfg = dict(self.config.get("debug", {}) or {})
+        self.debug_cfg.setdefault("enabled", False)
+        self.debug_cfg.setdefault("console", True)
+        self.debug_cfg.setdefault("profiling", True)
+        self.debug_cfg.setdefault("profile_interval_sec", 5.0)
         self.console_logs_enabled = bool(self.runtime_cfg.get("console_logs", False))
         self.suppress_opencv_warnings = bool(self.runtime_cfg.get("suppress_opencv_warnings", True))
         self.auto_scan_cameras_on_startup = bool(self.runtime_cfg.get("auto_scan_cameras_on_startup", False))
         self.auto_start_live = bool(self.runtime_cfg.get("auto_start_live", True))
+        self.debug_enabled = bool(self.debug_cfg.get("enabled", False))
+        self.debug_console_enabled = bool(self.debug_cfg.get("console", True))
+        self.debug_profiling_enabled = bool(self.debug_cfg.get("profiling", True))
+        self.debug_profile_interval_sec = max(0.5, float(self.debug_cfg.get("profile_interval_sec", 5.0)))
         _configure_opencv_logging(silent=self.suppress_opencv_warnings)
         self.tracker_enabled = bool(self.tracker_cfg.get("enabled", True))
-        self.byte_tracker_cls: type[Any] | None = None
+        self.tracker_backend_name = str(self.tracker_cfg.get("backend", "botsort")).strip().lower() or "botsort"
+        self.tracker_backend_cls: type[Any] | None = None
         self._tracker_disabled_reason: str | None = None
         if self.tracker_enabled:
-            self.byte_tracker_cls, tracker_error = _resolve_bytetrack_backend()
-            if self.byte_tracker_cls is None:
+            self.tracker_backend_cls, tracker_error = _resolve_tracker_backend(self.tracker_backend_name)
+            if self.tracker_backend_cls is None:
                 self.tracker_enabled = False
-                self._tracker_disabled_reason = f"ByteTrack disabled: {tracker_error or 'backend unavailable'}"
+                backend_label = self.tracker_backend_name or "tracker"
+                self._tracker_disabled_reason = f"{backend_label} disabled: {tracker_error or 'backend unavailable'}"
 
         self.model: YOLO | None = None
         self.model_reference = ""
@@ -1364,6 +1448,16 @@ class InferenceWindow(QMainWindow):
         self._infer_worker_error: str | None = None
         self._infer_notices: list[str] = []
         self._infer_worker_rr_cursor = 0
+        self._infer_batch_coalesce_ms = float(
+            _clamp(float(self.runtime_cfg.get("infer_batch_coalesce_ms", 4.0)), 0.0, 15.0)
+        )
+        self._tracker_warn_last_ts: dict[str, float] = {}
+        self._debug_profile_lock = threading.Lock()
+        self._debug_profile_stats: dict[str, dict[str, float]] = {}
+        self._debug_uniform_samples_ms: list[float] = []
+        self._debug_batch_size_total = 0.0
+        self._debug_batch_size_count = 0
+        self._debug_profile_last_flush_ts = time.perf_counter()
         self._ignore_mask_cache: dict[str, tuple[tuple[int, int], str, np.ndarray]] = {}
         self._uniform_track_memory: dict[str, dict[int, dict[str, Any]]] = {}
         self._uniform_memory_decay = float(_clamp(float(self.runtime_cfg.get("uniform_memory_decay", 0.88)), 0.5, 0.99))
@@ -1373,6 +1467,9 @@ class InferenceWindow(QMainWindow):
         )
         self._uniform_memory_max_bad_streak = max(1, int(self.runtime_cfg.get("uniform_memory_max_bad_streak", 4)))
         self._uniform_memory_ttl_sec = max(1.0, float(self.runtime_cfg.get("uniform_memory_ttl_sec", 5.0)))
+        self._uniform_recheck_interval_sec = max(0.0, float(self.runtime_cfg.get("uniform_recheck_interval_sec", 0.30)))
+        self._uniform_recheck_iou = float(_clamp(float(self.runtime_cfg.get("uniform_recheck_iou", 0.85)), 0.2, 0.99))
+        self._uniform_max_fresh_per_cycle = max(1, int(self.runtime_cfg.get("uniform_max_fresh_per_cycle", 2)))
         self._event_writer_cond = threading.Condition()
         self._event_writer_queue: deque[tuple[str, int, np.ndarray]] = deque()
         self._event_writer_pending: dict[tuple[str, int], int] = {}
@@ -1424,7 +1521,7 @@ class InferenceWindow(QMainWindow):
         if self._tracker_disabled_reason:
             self._log(self._tracker_disabled_reason)
         elif self.tracker_enabled:
-            self._log("ByteTrack enabled.")
+            self._log(f"Tracker enabled: {self.tracker_backend_name}.")
 
         self.model_catalog: list[dict[str, Any]] = []
         self.model_table_row_map: list[int | None] = []
@@ -1487,6 +1584,75 @@ class InferenceWindow(QMainWindow):
             self._pending_log_lines.append(line)
             if not self._log_flush_timer.isActive():
                 self._log_flush_timer.start(self._log_flush_interval_ms)
+
+    def _debug_console(self, message: str) -> None:
+        if not self.debug_enabled or not self.debug_console_enabled:
+            return
+        timestamp = time.strftime("%H:%M:%S")
+        print(f"[debug {timestamp}] {message}")
+
+    def _profile_add(self, stage: str, elapsed_sec: float, *, units: int = 1) -> None:
+        if not self.debug_enabled or not self.debug_profiling_enabled:
+            return
+        safe_units = max(1, int(units))
+        safe_elapsed = max(0.0, float(elapsed_sec))
+        with self._debug_profile_lock:
+            entry = self._debug_profile_stats.setdefault(
+                stage,
+                {"total_sec": 0.0, "count": 0.0, "max_ms": 0.0},
+            )
+            entry["total_sec"] += safe_elapsed
+            entry["count"] += float(safe_units)
+            entry["max_ms"] = max(float(entry.get("max_ms", 0.0)), (safe_elapsed * 1000.0) / safe_units)
+            if stage == "uniform":
+                self._debug_uniform_samples_ms.append((safe_elapsed * 1000.0) / safe_units)
+
+    def _profile_batch_size(self, batch_size: int) -> None:
+        if not self.debug_enabled or not self.debug_profiling_enabled:
+            return
+        with self._debug_profile_lock:
+            self._debug_batch_size_total += float(max(0, int(batch_size)))
+            self._debug_batch_size_count += 1
+
+    def _maybe_flush_debug_profile(self) -> None:
+        if not self.debug_enabled or not self.debug_profiling_enabled:
+            return
+        now_ts = time.perf_counter()
+        if (now_ts - self._debug_profile_last_flush_ts) < self.debug_profile_interval_sec:
+            return
+
+        with self._debug_profile_lock:
+            snapshot = dict(self._debug_profile_stats)
+            self._debug_profile_stats.clear()
+            uniform_samples = sorted(float(value) for value in self._debug_uniform_samples_ms)
+            self._debug_uniform_samples_ms.clear()
+            batch_size_total = float(self._debug_batch_size_total)
+            batch_size_count = int(self._debug_batch_size_count)
+            self._debug_batch_size_total = 0.0
+            self._debug_batch_size_count = 0
+            self._debug_profile_last_flush_ts = now_ts
+
+        if not snapshot:
+            return
+
+        parts: list[str] = []
+        for stage in sorted(snapshot.keys()):
+            entry = snapshot[stage]
+            count = max(1.0, float(entry.get("count", 0.0)))
+            total_ms = float(entry.get("total_sec", 0.0)) * 1000.0
+            avg_ms = total_ms / count
+            max_ms = float(entry.get("max_ms", 0.0))
+            parts.append(f"{stage}: avg={avg_ms:.2f}ms max={max_ms:.2f}ms n={int(round(count))}")
+
+        if batch_size_count > 0:
+            avg_batch_size = batch_size_total / float(batch_size_count)
+            parts.append(f"batch: avg_size={avg_batch_size:.2f} n={batch_size_count}")
+
+        if uniform_samples:
+            p95_index = min(len(uniform_samples) - 1, max(0, int(math.ceil(len(uniform_samples) * 0.95)) - 1))
+            parts.append(f"uniform_p95={uniform_samples[p95_index]:.2f}ms")
+
+        self._debug_console("profile | " + " | ".join(parts))
 
     def _flush_logs_widget(self) -> None:
         if not hasattr(self, "logs_text") or self.logs_text is None:
@@ -5867,8 +6033,14 @@ class InferenceWindow(QMainWindow):
             self._infer_last_submit_ts[source_name] = float(submit_ts)
             self._infer_has_work_event.set()
 
-    def _pull_inference_batch(self) -> tuple[list[str], list[np.ndarray]]:
+    def _pull_inference_batch(
+        self,
+        *,
+        max_items: int | None = None,
+        exclude_sources: set[str] | None = None,
+    ) -> tuple[list[str], list[np.ndarray]]:
         with self._infer_lock:
+            excluded = exclude_sources or set()
             source_names = list(self._infer_pending_frames.keys())
             if not source_names:
                 self._infer_has_work_event.clear()
@@ -5877,7 +6049,15 @@ class InferenceWindow(QMainWindow):
             total = len(source_names)
             start = self._infer_worker_rr_cursor % total
             ordered = [source_names[(start + idx) % total] for idx in range(total)]
-            chosen = ordered[: self._effective_max_infer_per_tick()]
+            available = [source_name for source_name in ordered if source_name not in excluded]
+            limit = self._effective_max_infer_per_tick() if max_items is None else max(1, int(max_items))
+            chosen = available[:limit]
+            if not chosen:
+                if self._infer_pending_frames:
+                    self._infer_has_work_event.set()
+                else:
+                    self._infer_has_work_event.clear()
+                return [], []
             self._infer_worker_rr_cursor = (start + len(chosen)) % max(1, total)
 
             batch_sources: list[str] = []
@@ -5893,6 +6073,45 @@ class InferenceWindow(QMainWindow):
             else:
                 self._infer_has_work_event.clear()
         return batch_sources, batch_frames
+
+    def _coalesce_inference_batch(
+        self,
+        source_batch: list[str],
+        frame_batch: list[np.ndarray],
+    ) -> tuple[list[str], list[np.ndarray]]:
+        if not source_batch:
+            return source_batch, frame_batch
+
+        coalesce_ms = self._infer_batch_coalesce_ms
+        target_size = self._effective_max_infer_per_tick()
+        if coalesce_ms <= 0.0 or len(source_batch) >= target_size:
+            return source_batch, frame_batch
+
+        # Short coalescing window allows neighboring sources to join one GPU pass.
+        deadline = time.perf_counter() + (coalesce_ms / 1000.0)
+        selected_sources = set(source_batch)
+        while len(source_batch) < target_size:
+            now_ts = time.perf_counter()
+            if now_ts >= deadline:
+                break
+            wait_sec = max(0.0005, min(0.0015, deadline - now_ts))
+            self._infer_has_work_event.wait(wait_sec)
+
+            remaining = target_size - len(source_batch)
+            if remaining <= 0:
+                break
+            extra_sources, extra_frames = self._pull_inference_batch(
+                max_items=remaining,
+                exclude_sources=selected_sources,
+            )
+            if not extra_sources:
+                continue
+
+            source_batch.extend(extra_sources)
+            frame_batch.extend(extra_frames)
+            selected_sources.update(extra_sources)
+
+        return source_batch, frame_batch
 
     def _start_inference_worker(self) -> None:
         if self._infer_thread is not None and self._infer_thread.is_alive():
@@ -5938,6 +6157,9 @@ class InferenceWindow(QMainWindow):
             if not source_batch:
                 continue
 
+            source_batch, frame_batch = self._coalesce_inference_batch(source_batch, frame_batch)
+            self._profile_batch_size(len(source_batch))
+
             try:
                 mode = resolve_security_mode(self.security_cfg)
                 batch_results = self._predict_batch_for_mode(frame_batch, mode)
@@ -5982,8 +6204,8 @@ class InferenceWindow(QMainWindow):
         with self._infer_lock:
             worker_error = self._infer_worker_error
             self._infer_worker_error = None
-            updates = dict(self._infer_results)
-            self._infer_results.clear()
+            updates = self._infer_results
+            self._infer_results = {}
 
         if worker_error:
             self.stop_live()
@@ -6220,13 +6442,14 @@ class InferenceWindow(QMainWindow):
                 runtime.capture_latest_seq += 1
 
     def _build_tracker_args(self) -> SimpleNamespace:
+        backend = str(self.tracker_cfg.get("backend", self.tracker_backend_name)).strip().lower() or self.tracker_backend_name
         high = float(_clamp(float(self.tracker_cfg.get("track_high_thresh", 0.5)), 0.0, 1.0))
         low = float(_clamp(float(self.tracker_cfg.get("track_low_thresh", 0.1)), 0.0, high))
         new_track = float(_clamp(float(self.tracker_cfg.get("new_track_thresh", 0.6)), low, 1.0))
         match = float(_clamp(float(self.tracker_cfg.get("match_thresh", 0.8)), 0.0, 1.0))
         track_buffer = max(1, int(self.tracker_cfg.get("track_buffer", 30)))
         fuse_score = bool(self.tracker_cfg.get("fuse_score", True))
-        return SimpleNamespace(
+        args = SimpleNamespace(
             track_high_thresh=high,
             track_low_thresh=low,
             new_track_thresh=new_track,
@@ -6234,12 +6457,26 @@ class InferenceWindow(QMainWindow):
             match_thresh=match,
             fuse_score=fuse_score,
         )
+        if backend == "botsort":
+            args.tracker_type = "botsort"
+            args.proximity_thresh = float(_clamp(float(self.tracker_cfg.get("proximity_thresh", 0.5)), 0.0, 1.0))
+            args.appearance_thresh = float(_clamp(float(self.tracker_cfg.get("appearance_thresh", 0.25)), 0.0, 1.0))
+            args.with_reid = bool(self.tracker_cfg.get("with_reid", False))
+            args.gmc_method = str(self.tracker_cfg.get("gmc_method", "none")).strip() or "none"
+            args.cmc_method = str(self.tracker_cfg.get("cmc_method", args.gmc_method)).strip() or args.gmc_method
+            args.lambda_ = float(_clamp(float(self.tracker_cfg.get("lambda", 0.98)), 0.0, 1.0))
+        else:
+            args.tracker_type = "bytetrack"
+        return args
 
     def _reset_tracker_for_source(self, source_name: str, runtime: SourceRuntime | None = None) -> None:
         with self._infer_lock:
             self.trackers.pop(source_name, None)
             self._uniform_track_memory.pop(source_name, None)
-        if not self.tracker_enabled or self.byte_tracker_cls is None:
+        if runtime is not None:
+            runtime.last_tracked_boxes = None
+            runtime.last_tracker_update_ts = 0.0
+        if not self.tracker_enabled or self.tracker_backend_cls is None:
             return
 
         configured_rate = int(self.tracker_cfg.get("frame_rate", 30))
@@ -6251,11 +6488,11 @@ class InferenceWindow(QMainWindow):
             frame_rate = 30
 
         try:
-            tracker = self.byte_tracker_cls(args=self._build_tracker_args(), frame_rate=frame_rate)
+            tracker = self.tracker_backend_cls(args=self._build_tracker_args(), frame_rate=frame_rate)
             with self._infer_lock:
                 self.trackers[source_name] = tracker
         except Exception as exc:  # noqa: BLE001
-            self._queue_async_notice(f"[warn] ByteTrack init failed for '{source_name}': {exc}")
+            self._queue_async_notice(f"[warn] Tracker init failed for '{source_name}' ({self.tracker_backend_name}): {exc}")
             with self._infer_lock:
                 self.trackers.pop(source_name, None)
 
@@ -6352,7 +6589,9 @@ class InferenceWindow(QMainWindow):
         return ok
 
     def _read_frame(self, runtime: SourceRuntime) -> tuple[np.ndarray | None, bool]:
+        read_started_ts = time.perf_counter()
         if not self._ensure_capture(runtime):
+            self._profile_add("capture", time.perf_counter() - read_started_ts)
             return None, False
 
         latest_frame: np.ndarray | None = None
@@ -6370,11 +6609,14 @@ class InferenceWindow(QMainWindow):
                 with self._capture_lock:
                     runtime.capture_last_consumed_seq = latest_seq
             runtime.last_input = latest_frame
+            self._profile_add("capture", time.perf_counter() - read_started_ts)
             return latest_frame, fresh
 
         runtime.status = "no-frame"
         if runtime.last_input is not None:
+            self._profile_add("capture", time.perf_counter() - read_started_ts)
             return runtime.last_input, False
+        self._profile_add("capture", time.perf_counter() - read_started_ts)
         return None, False
 
     def _predict_batch_with_fallback(self, frames: list[np.ndarray]) -> list[Any]:
@@ -6412,49 +6654,152 @@ class InferenceWindow(QMainWindow):
                 results = self.model.predict(frames, **self.predict_kwargs)
                 return list(results)
 
-    def _predict_batch_for_mode(self, frames: list[np.ndarray], mode: str) -> list[Any]:
-        if mode == "day" and self._uniform_detection_enabled() and self.day_seg_model is not None:
-            with self._model_lock:
-                return list(self.day_seg_model.predict(frames, **self.day_seg_predict_kwargs))
-        return self._predict_batch_with_fallback(frames)
+    @staticmethod
+    def _tensor_like_to_torch(value: Any) -> torch.Tensor | None:
+        if value is None:
+            return None
+        try:
+            if isinstance(value, torch.Tensor):
+                return value.detach()
+            if isinstance(value, np.ndarray):
+                return torch.from_numpy(value)
+            return torch.as_tensor(value)
+        except Exception:  # noqa: BLE001
+            return None
 
-    def _extract_person_boxes(self, result: Any) -> list[PersonDetection]:
-        boxes: list[PersonDetection] = []
+    @staticmethod
+    def _tensor_like_to_numpy(value: Any) -> np.ndarray | None:
+        if value is None:
+            return None
+        try:
+            if hasattr(value, "detach"):
+                value = value.detach()
+            if hasattr(value, "cpu"):
+                value = value.cpu()
+            return np.asarray(value)
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _extract_person_box_arrays(
+        self,
+        result: Any,
+    ) -> tuple[list[PersonDetection], np.ndarray | None, np.ndarray | None]:
+        box_extract_started_ts = time.perf_counter()
         raw_boxes = getattr(result, "boxes", None)
         if raw_boxes is None:
-            return boxes
+            self._profile_add("box_extract", time.perf_counter() - box_extract_started_ts)
+            return [], None, None
 
         try:
-            xyxy_values = raw_boxes.xyxy
-            conf_values = raw_boxes.conf
-            cls_values = raw_boxes.cls
+            xyxy_tensor = self._tensor_like_to_torch(raw_boxes.xyxy)
+            conf_tensor = self._tensor_like_to_torch(raw_boxes.conf)
+            cls_tensor = self._tensor_like_to_torch(raw_boxes.cls)
+            raw_data_tensor = self._tensor_like_to_torch(raw_boxes.data if hasattr(raw_boxes, "data") else None)
         except Exception:  # noqa: BLE001
-            return boxes
+            self._profile_add("box_extract", time.perf_counter() - box_extract_started_ts)
+            return [], None, None
 
-        try:
-            xyxy_list = xyxy_values.tolist()
-            conf_list = conf_values.tolist() if conf_values is not None else [1.0] * len(xyxy_list)
-            cls_list = cls_values.tolist() if cls_values is not None else [0.0] * len(xyxy_list)
-        except Exception:  # noqa: BLE001
-            return boxes
+        if xyxy_tensor is None or xyxy_tensor.ndim != 2 or int(xyxy_tensor.shape[1]) < 4:
+            self._profile_add("box_extract", time.perf_counter() - box_extract_started_ts)
+            return [], None, None
 
-        for coords, conf, cls_id in zip(xyxy_list, conf_list, cls_list):
-            if int(cls_id) != 0:
-                continue
-            if len(coords) < 4:
-                continue
-            x1, y1, x2, y2 = int(coords[0]), int(coords[1]), int(coords[2]), int(coords[3])
-            if x2 <= x1 or y2 <= y1:
-                continue
-            boxes.append(PersonDetection(x1=x1, y1=y1, x2=x2, y2=y2, conf=float(conf), track_id=None))
+        row_count = int(xyxy_tensor.shape[0])
+        if row_count <= 0:
+            self._profile_add("box_extract", time.perf_counter() - box_extract_started_ts)
+            return [], None, None
 
-        return boxes
+        if conf_tensor is None or int(conf_tensor.numel()) != row_count:
+            conf_tensor = torch.ones((row_count,), dtype=torch.float32, device=xyxy_tensor.device)
+        else:
+            conf_tensor = conf_tensor.reshape(-1).to(dtype=torch.float32)
+
+        if cls_tensor is None or int(cls_tensor.numel()) != row_count:
+            cls_tensor = torch.zeros((row_count,), dtype=torch.float32, device=xyxy_tensor.device)
+        else:
+            cls_tensor = cls_tensor.reshape(-1)
+
+        class_mask = cls_tensor.to(dtype=torch.int64) == 0
+        geometry_mask = (xyxy_tensor[:, 2] > xyxy_tensor[:, 0]) & (xyxy_tensor[:, 3] > xyxy_tensor[:, 1])
+        keep_mask = class_mask & geometry_mask
+
+        keep_indices_tensor = torch.nonzero(keep_mask, as_tuple=False).flatten()
+        if int(keep_indices_tensor.numel()) <= 0:
+            self._profile_add("box_extract", time.perf_counter() - box_extract_started_ts)
+            return [], None, None
+
+        selected_xyxy = xyxy_tensor.index_select(0, keep_indices_tensor).to(dtype=torch.float32)
+        selected_conf = conf_tensor.index_select(0, keep_indices_tensor)
+
+        xyxy_array = self._tensor_like_to_numpy(selected_xyxy)
+        conf_array = self._tensor_like_to_numpy(selected_conf)
+        keep_index_array = self._tensor_like_to_numpy(keep_indices_tensor.to(dtype=torch.int32))
+
+        if xyxy_array is None or conf_array is None or keep_index_array is None:
+            self._profile_add("box_extract", time.perf_counter() - box_extract_started_ts)
+            return [], None, None
+
+        raw_box_array: np.ndarray | None = None
+        if raw_data_tensor is not None and raw_data_tensor.ndim == 2 and int(raw_data_tensor.shape[0]) == row_count:
+            selected_raw = raw_data_tensor.index_select(0, keep_indices_tensor)
+            raw_box_array = self._tensor_like_to_numpy(selected_raw)
+        if raw_box_array is None:
+            selected_cls = cls_tensor.index_select(0, keep_indices_tensor).to(dtype=torch.float32)
+            raw_box_tensor = torch.cat(
+                (
+                    selected_xyxy,
+                    selected_conf.unsqueeze(1),
+                    selected_cls.unsqueeze(1),
+                ),
+                dim=1,
+            )
+            raw_box_array = self._tensor_like_to_numpy(raw_box_tensor)
+
+        detections: list[PersonDetection] = []
+        selected_count = int(xyxy_array.shape[0])
+        for index in range(selected_count):
+            coords = xyxy_array[index]
+            x1 = int(coords[0])
+            y1 = int(coords[1])
+            x2 = int(coords[2])
+            y2 = int(coords[3])
+            detections.append(
+                PersonDetection(
+                    x1=x1,
+                    y1=y1,
+                    x2=x2,
+                    y2=y2,
+                    conf=float(conf_array[index]),
+                    track_id=None,
+                )
+            )
+
+        self._profile_add("box_extract", time.perf_counter() - box_extract_started_ts)
+        return detections, keep_index_array, raw_box_array
+
+    def _predict_batch_for_mode(self, frames: list[np.ndarray], mode: str) -> list[Any]:
+        predict_started_ts = time.perf_counter()
+        if mode == "day" and self._uniform_detection_enabled() and self.day_seg_model is not None:
+            with self._model_lock:
+                results = list(self.day_seg_model.predict(frames, **self.day_seg_predict_kwargs))
+            self._profile_add("predict", time.perf_counter() - predict_started_ts, units=len(frames))
+            return results
+        results = self._predict_batch_with_fallback(frames)
+        self._profile_add("predict", time.perf_counter() - predict_started_ts, units=len(frames))
+        return results
+
+    def _extract_person_boxes(self, result: Any) -> list[PersonDetection]:
+        detections, _keep_indices, _raw_box_array = self._extract_person_box_arrays(result)
+        return detections
 
     def _extract_person_segmentation_candidates(
         self,
         result: Any,
+        pre_extracted: tuple[list[PersonDetection], np.ndarray | None] | None = None,
     ) -> list[tuple[PersonDetection, np.ndarray | None]]:
-        detections = self._extract_person_boxes(result)
+        if pre_extracted is None:
+            detections, keep_indices, _raw_box_array = self._extract_person_box_arrays(result)
+        else:
+            detections, keep_indices = pre_extracted
         if not detections:
             return []
 
@@ -6463,19 +6808,44 @@ class InferenceWindow(QMainWindow):
         if raw_masks is not None:
             try:
                 mask_data = raw_masks.data
-                mask_array_values = mask_data.cpu().numpy() if hasattr(mask_data, "cpu") else np.asarray(mask_data)
-                if mask_array_values.ndim == 3:
-                    limit = min(len(mask_arrays), int(mask_array_values.shape[0]))
-                    for index in range(limit):
-                        mask_arrays[index] = (mask_array_values[index] > 0.5).astype(np.uint8) * 255
+                mask_tensor = self._tensor_like_to_torch(mask_data)
+                if mask_tensor is not None and mask_tensor.ndim == 3:
+                    if keep_indices is not None and keep_indices.size > 0:
+                        index_tensor = torch.as_tensor(keep_indices, device=mask_tensor.device, dtype=torch.int64)
+                        index_tensor = index_tensor[index_tensor < int(mask_tensor.shape[0])]
+                        selected_masks_tensor = mask_tensor.index_select(0, index_tensor) if int(index_tensor.numel()) > 0 else None
+                    else:
+                        selected_masks_tensor = None
+
+                    if selected_masks_tensor is not None:
+                        selected_masks = self._tensor_like_to_numpy(selected_masks_tensor)
+                    else:
+                        selected_masks = None
+
+                    if selected_masks is not None and selected_masks.ndim == 3:
+                        limit = min(len(mask_arrays), int(selected_masks.shape[0]))
+                        for index in range(limit):
+                            mask_arrays[index] = np.ascontiguousarray((selected_masks[index] > 0.5).astype(np.uint8) * 255)
             except Exception:  # noqa: BLE001
                 pass
         return list(zip(detections, mask_arrays))
 
-    def _analyze_day_uniform_detections(self, frame: np.ndarray, result: Any) -> list[PersonDetection]:
-        candidates = self._extract_person_segmentation_candidates(result)
+    def _analyze_day_uniform_detections(
+        self,
+        source_name: str,
+        frame: np.ndarray,
+        result: Any,
+        tracked_boxes: list[PersonDetection],
+        pre_extracted: tuple[list[PersonDetection], np.ndarray | None] | None = None,
+    ) -> list[PersonDetection]:
+        uniform_started_ts = time.perf_counter()
+        candidates = self._extract_person_segmentation_candidates(result, pre_extracted=pre_extracted)
         if not candidates:
+            self._profile_add("uniform", time.perf_counter() - uniform_started_ts)
             return []
+
+        detections_only = [detection for detection, _mask in candidates]
+        self._attach_track_ids_to_day_detections(detections_only, tracked_boxes)
 
         tolerance = float(self.uniform_cfg.get("color_tolerance", UNIFORM_COLOR_TOLERANCE_DEFAULT))
         min_pixels = max(20, int(self.uniform_cfg.get("min_mask_pixels", UNIFORM_MIN_MASK_PIXELS_DEFAULT)))
@@ -6484,45 +6854,62 @@ class InferenceWindow(QMainWindow):
         target_lower_hex = _normalize_hex_color(self.uniform_cfg.get("bottom_color", UNIFORM_BOTTOM_DEFAULT), UNIFORM_BOTTOM_DEFAULT)
         target_upper_bgr = _hex_to_bgr(target_upper_hex)
         target_lower_bgr = _hex_to_bgr(target_lower_hex)
+        min_section_pixels = max(24, min_pixels // 3)
+        now_ts = time.perf_counter()
+
+        with self._infer_lock:
+            source_memory_snapshot = dict(self._uniform_track_memory.get(source_name, {}))
 
         detections: list[PersonDetection] = []
-        frame_h, frame_w = frame.shape[:2]
+        fresh_analysis_used = 0
         for detection, seg_mask in candidates:
-            working_mask = seg_mask
-            if working_mask is None:
+            cache_entry = None
+            if detection.track_id is not None:
+                cache_entry = source_memory_snapshot.get(int(detection.track_id))
+            if (
+                cache_entry
+                and self._uniform_recheck_interval_sec > 0.0
+                and (now_ts - float(cache_entry.get("analysis_ts", 0.0))) <= self._uniform_recheck_interval_sec
+                and self._apply_cached_uniform_decision(detection, cache_entry)
+            ):
+                detections.append(detection)
+                continue
+
+            if cache_entry is not None and fresh_analysis_used >= self._uniform_max_fresh_per_cycle:
+                if self._apply_cached_uniform_decision(detection, cache_entry):
+                    detections.append(detection)
+                    continue
+
+            fresh_analysis_used += 1
+
+            mask_roi_info = _extract_mask_roi_for_detection(seg_mask, detection, frame.shape)
+            if mask_roi_info is None:
                 detection.has_segmentation = False
-                detection.upper_match = False
-                detection.lower_match = False
-                detection.uniform_match = False
+                detection.upper_match = None
+                detection.lower_match = None
+                detection.uniform_match = None
+                detection.visible_section_count = 0
                 detection.is_intruder = True
                 detection.label = "intruz"
+                self._store_uniform_analysis_cache(source_name, detection, now_ts)
                 detections.append(detection)
                 continue
 
-            if working_mask.shape[0] != frame_h or working_mask.shape[1] != frame_w:
-                try:
-                    working_mask = cv2.resize(working_mask, (frame_w, frame_h), interpolation=cv2.INTER_NEAREST)
-                except Exception:  # noqa: BLE001
-                    working_mask = None
-            detection.has_segmentation = working_mask is not None
-
-            if working_mask is None:
-                detection.upper_match = False
-                detection.lower_match = False
-                detection.uniform_match = False
-                detection.is_intruder = True
-                detection.label = "intruz"
-                detections.append(detection)
-                continue
+            working_mask, clipped_bbox = mask_roi_info
+            x1, y1, x2, y2 = clipped_bbox
+            frame_roi = frame[y1:y2, x1:x2]
+            detection.has_segmentation = True
 
             mask_rows = np.where(working_mask > 0)[0]
             if mask_rows.size == 0:
                 detection.has_segmentation = False
-                detection.upper_match = False
-                detection.lower_match = False
-                detection.uniform_match = False
+                detection.upper_match = None
+                detection.lower_match = None
+                detection.uniform_match = None
+                detection.visible_section_count = 0
                 detection.is_intruder = True
                 detection.label = "intruz"
+                self._store_uniform_analysis_cache(source_name, detection, now_ts)
                 detections.append(detection)
                 continue
 
@@ -6537,38 +6924,56 @@ class InferenceWindow(QMainWindow):
             lower_end = max(lower_start + 1, lower_end)
 
             upper_sample = _compute_region_color(
-                frame,
+                frame_roi,
                 working_mask,
-                upper_start,
-                upper_end,
+                max(0, upper_start),
+                min(working_mask.shape[0], upper_end),
                 center_band_fraction=center_band_fraction,
             )
             lower_sample = _compute_region_color(
-                frame,
+                frame_roi,
                 working_mask,
-                lower_start,
-                lower_end,
+                max(0, lower_start),
+                min(working_mask.shape[0], lower_end),
                 center_band_fraction=center_band_fraction,
             )
 
             upper_match: bool | None = None
             lower_match: bool | None = None
+            visible_section_count = 0
             if upper_sample is not None:
                 detection.upper_color_hex = upper_sample[0]
+                if upper_sample[1] >= min_section_pixels:
+                    visible_section_count += 1
                 if upper_sample[1] >= min_pixels:
                     upper_match = _lab_color_distance(_hex_to_bgr(upper_sample[0]), target_upper_bgr) <= tolerance
             if lower_sample is not None:
                 detection.lower_color_hex = lower_sample[0]
+                if lower_sample[1] >= min_section_pixels:
+                    visible_section_count += 1
                 if lower_sample[1] >= min_pixels:
                     lower_match = _lab_color_distance(_hex_to_bgr(lower_sample[0]), target_lower_bgr) <= tolerance
 
             detection.upper_match = upper_match
             detection.lower_match = lower_match
-            detection.uniform_match = (upper_match is not False) and (lower_match is not False)
-            detection.is_intruder = bool(upper_match is False or lower_match is False)
+            detection.visible_section_count = visible_section_count
+
+            false_count = int(upper_match is False) + int(lower_match is False)
+            true_count = int(upper_match is True) + int(lower_match is True)
+            if false_count > 0:
+                detection.uniform_match = False
+                detection.is_intruder = True
+            elif true_count > 0:
+                detection.uniform_match = True
+                detection.is_intruder = False
+            else:
+                detection.uniform_match = None
+                detection.is_intruder = True
             detection.label = "intruz" if detection.is_intruder else "pracownik"
+            self._store_uniform_analysis_cache(source_name, detection, now_ts)
             detections.append(detection)
 
+        self._profile_add("uniform", time.perf_counter() - uniform_started_ts)
         return detections
 
     def _extract_tracked_person_boxes(
@@ -6577,22 +6982,30 @@ class InferenceWindow(QMainWindow):
         runtime: SourceRuntime | None,
         result: Any,
         frame: np.ndarray,
+        mode: str = "day",
+        pre_extracted: tuple[list[PersonDetection], np.ndarray | None, np.ndarray | None] | None = None,
     ) -> list[PersonDetection]:
         if not self.tracker_enabled:
+            if pre_extracted is not None:
+                return pre_extracted[0]
             return self._extract_person_boxes(result)
 
-        raw_boxes = getattr(result, "boxes", None)
-        if raw_boxes is None:
+        default_update_fps = min(float(self.model_target_fps), 12.0)
+        tracker_update_fps = max(1.0, float(self.tracker_cfg.get("max_update_fps", default_update_fps)))
+        if pre_extracted is None:
+            raw_detections, _keep_indices, raw_box_array = self._extract_person_box_arrays(result)
+        else:
+            raw_detections, _keep_indices, raw_box_array = pre_extracted
+        if runtime is not None and runtime.last_tracked_boxes is not None and runtime.last_tracker_update_ts > 0.0:
+            now_ts = time.perf_counter()
+            if (now_ts - runtime.last_tracker_update_ts) < (1.0 / tracker_update_fps):
+                tracker_started_ts = time.perf_counter()
+                reused = self._reuse_recent_track_ids(raw_detections, runtime.last_tracked_boxes)
+                self._profile_add("tracker", time.perf_counter() - tracker_started_ts)
+                return reused
+
+        if raw_box_array is None or raw_box_array.ndim != 2 or raw_box_array.shape[0] == 0:
             return []
-        try:
-            if len(raw_boxes) == 0:
-                return []
-        except Exception:  # noqa: BLE001
-            try:
-                if getattr(raw_boxes, "shape", (0,))[0] == 0:
-                    return []
-            except Exception:  # noqa: BLE001
-                pass
 
         with self._infer_lock:
             tracker = self.trackers.get(source_name)
@@ -6601,20 +7014,38 @@ class InferenceWindow(QMainWindow):
             with self._infer_lock:
                 tracker = self.trackers.get(source_name)
             if tracker is None:
-                return self._extract_person_boxes(result)
+                return raw_detections
 
         try:
-            tracks = tracker.update(raw_boxes.cpu().numpy(), img=frame)
+            tracker_started_ts = time.perf_counter()
+            raw_boxes = getattr(result, "boxes", None)
+            if raw_boxes is not None and hasattr(raw_boxes, "cpu"):
+                raw_boxes = raw_boxes.cpu()
+            tracks = tracker.update(raw_boxes, img=frame)
+            self._profile_add("tracker", time.perf_counter() - tracker_started_ts)
         except Exception as exc:  # noqa: BLE001
-            self._queue_async_notice(f"[warn] ByteTrack failed on '{source_name}', fallback to raw detections: {exc}")
+            now_ts = time.perf_counter()
+            last_warn_ts = float(self._tracker_warn_last_ts.get(source_name, 0.0))
+            if (now_ts - last_warn_ts) >= 2.0:
+                self._tracker_warn_last_ts[source_name] = now_ts
+                self._queue_async_notice(
+                    f"[warn] Tracker failed on '{source_name}' ({self.tracker_backend_name}), fallback to raw detections: {exc}"
+                )
             self._reset_tracker_for_source(source_name, runtime)
-            return self._extract_person_boxes(result)
+            return raw_detections
 
         boxes: list[PersonDetection] = []
         if tracks is None or len(tracks) == 0:
+            if runtime is not None:
+                runtime.last_tracked_boxes = []
+                runtime.last_tracker_update_ts = time.perf_counter()
             return boxes
 
-        for row in tracks.tolist():
+        track_rows = self._tensor_like_to_numpy(tracks)
+        if track_rows is None or track_rows.ndim != 2:
+            return boxes
+
+        for row in track_rows:
             if len(row) < 7:
                 continue
             x1, y1, x2, y2, track_id, score, cls_id = row[:7]
@@ -6642,6 +7073,9 @@ class InferenceWindow(QMainWindow):
                     track_id=parsed_track_id,
                 )
             )
+        if runtime is not None:
+            runtime.last_tracked_boxes = boxes
+            runtime.last_tracker_update_ts = time.perf_counter()
         return boxes
 
     def _bbox_iou(self, first: PersonDetection, second: PersonDetection) -> float:
@@ -6665,7 +7099,9 @@ class InferenceWindow(QMainWindow):
         detections: list[PersonDetection],
         tracked_boxes: list[PersonDetection],
     ) -> None:
+        match_started_ts = time.perf_counter()
         if not detections or not tracked_boxes:
+            self._profile_add("match_ids", time.perf_counter() - match_started_ts)
             return
 
         used_tracked: set[int] = set()
@@ -6687,6 +7123,84 @@ class InferenceWindow(QMainWindow):
             detection.track_id = tracked.track_id
             detection.conf = max(float(detection.conf), float(tracked.conf))
             used_tracked.add(best_index)
+        self._profile_add("match_ids", time.perf_counter() - match_started_ts)
+
+    def _reuse_recent_track_ids(
+        self,
+        detections: list[PersonDetection],
+        previous_tracked_boxes: list[PersonDetection] | None,
+    ) -> list[PersonDetection]:
+        if not detections or not previous_tracked_boxes:
+            return detections
+        self._attach_track_ids_to_day_detections(detections, previous_tracked_boxes)
+        return detections
+
+    def _apply_cached_uniform_decision(
+        self,
+        detection: PersonDetection,
+        entry: dict[str, Any],
+    ) -> bool:
+        analysis_ts = float(entry.get("analysis_ts", 0.0))
+        cached_bbox = entry.get("analysis_bbox")
+        if analysis_ts <= 0.0 or not isinstance(cached_bbox, (list, tuple)) or len(cached_bbox) != 4:
+            return False
+
+        try:
+            cached_detection = PersonDetection(
+                x1=int(cached_bbox[0]),
+                y1=int(cached_bbox[1]),
+                x2=int(cached_bbox[2]),
+                y2=int(cached_bbox[3]),
+                conf=float(detection.conf),
+            )
+        except Exception:  # noqa: BLE001
+            return False
+
+        if self._bbox_iou(detection, cached_detection) < self._uniform_recheck_iou:
+            return False
+
+        detection.has_segmentation = bool(entry.get("has_segmentation", False))
+        detection.upper_match = entry.get("upper_match")
+        detection.lower_match = entry.get("lower_match")
+        detection.upper_color_hex = str(entry.get("upper_color_hex", "") or "")
+        detection.lower_color_hex = str(entry.get("lower_color_hex", "") or "")
+        detection.uniform_match = entry.get("uniform_match")
+        detection.visible_section_count = int(entry.get("visible_section_count", 0) or 0)
+        detection.is_intruder = bool(entry.get("is_intruder", True))
+        detection.label = "intruz" if detection.is_intruder else "pracownik"
+        return True
+
+    def _store_uniform_analysis_cache(
+        self,
+        source_name: str,
+        detection: PersonDetection,
+        now_ts: float,
+    ) -> None:
+        if detection.track_id is None:
+            return
+
+        track_id = int(detection.track_id)
+        with self._infer_lock:
+            source_memory = self._uniform_track_memory.setdefault(source_name, {})
+            entry = source_memory.get(track_id)
+            if entry is None:
+                entry = {}
+                source_memory[track_id] = entry
+            entry.update(
+                {
+                    "analysis_ts": float(now_ts),
+                    "analysis_bbox": [int(detection.x1), int(detection.y1), int(detection.x2), int(detection.y2)],
+                    "has_segmentation": bool(detection.has_segmentation),
+                    "upper_match": detection.upper_match,
+                    "lower_match": detection.lower_match,
+                    "upper_color_hex": detection.upper_color_hex,
+                    "lower_color_hex": detection.lower_color_hex,
+                    "uniform_match": detection.uniform_match,
+                    "visible_section_count": int(detection.visible_section_count),
+                    "is_intruder": bool(detection.is_intruder),
+                    "last_seen_ts": float(now_ts),
+                }
+            )
 
     def _apply_uniform_temporal_memory(self, source_name: str, detections: list[PersonDetection]) -> None:
         now_ts = time.perf_counter()
@@ -6717,6 +7231,8 @@ class InferenceWindow(QMainWindow):
                     vote = 1.0
                 elif true_count == 1 and unknown_count == 1:
                     vote = 0.45
+                elif true_count == 0 and unknown_count == 2:
+                    vote = previous_score * self._uniform_memory_decay
                 else:
                     vote = 0.10
 
@@ -6734,6 +7250,8 @@ class InferenceWindow(QMainWindow):
                         keep_as_worker = True
                     elif false_count == 2 and bad_streak <= 1 and float(detection.conf) < 0.90:
                         keep_as_worker = True
+                    elif false_count == 0 and unknown_count >= 1:
+                        keep_as_worker = True
 
                     if keep_as_worker:
                         detection.is_intruder = False
@@ -6749,6 +7267,16 @@ class InferenceWindow(QMainWindow):
                     "score": score,
                     "bad_streak": bad_streak,
                     "last_seen_ts": now_ts,
+                    "analysis_ts": float(entry.get("analysis_ts", now_ts)),
+                    "analysis_bbox": entry.get("analysis_bbox", [int(detection.x1), int(detection.y1), int(detection.x2), int(detection.y2)]),
+                    "has_segmentation": bool(detection.has_segmentation),
+                    "upper_match": detection.upper_match,
+                    "lower_match": detection.lower_match,
+                    "upper_color_hex": detection.upper_color_hex,
+                    "lower_color_hex": detection.lower_color_hex,
+                    "uniform_match": detection.uniform_match,
+                    "visible_section_count": int(detection.visible_section_count),
+                    "is_intruder": bool(detection.is_intruder),
                 }
 
     def _extract_mode_detections(
@@ -6759,18 +7287,47 @@ class InferenceWindow(QMainWindow):
         frame: np.ndarray,
         mode: str,
     ) -> tuple[list[PersonDetection], int, int]:
+        postprocess_started_ts = time.perf_counter()
         if mode == "day" and self._uniform_detection_enabled():
-            detections = self._analyze_day_uniform_detections(frame, result)
-            tracked_boxes = self._extract_tracked_person_boxes(source_name, runtime, result, frame)
-            self._attach_track_ids_to_day_detections(detections, tracked_boxes)
+            pre_detections, pre_keep_indices, pre_raw_box_array = self._extract_person_box_arrays(result)
+            tracked_boxes = self._extract_tracked_person_boxes(
+                source_name,
+                runtime,
+                result,
+                frame,
+                mode,
+                pre_extracted=(pre_detections, pre_keep_indices, pre_raw_box_array),
+            )
+            detections_for_uniform = [
+                PersonDetection(
+                    x1=int(item.x1),
+                    y1=int(item.y1),
+                    x2=int(item.x2),
+                    y2=int(item.y2),
+                    conf=float(item.conf),
+                    track_id=item.track_id,
+                )
+                for item in pre_detections
+            ]
+            detections = self._analyze_day_uniform_detections(
+                source_name,
+                frame,
+                result,
+                tracked_boxes,
+                pre_extracted=(detections_for_uniform, pre_keep_indices),
+            )
             self._apply_uniform_temporal_memory(source_name, detections)
 
+            counts_started_ts = time.perf_counter()
             tracked_ids = {detection.track_id for detection in detections if detection.track_id is not None}
             person_count = len(tracked_ids) if tracked_ids else len(detections)
             intruder_count = sum(1 for detection in detections if detection.is_intruder)
+            self._profile_add("counts_labels", time.perf_counter() - counts_started_ts)
+            self._profile_add("postprocess", time.perf_counter() - postprocess_started_ts)
             return detections, person_count, intruder_count
 
-        detections = self._extract_tracked_person_boxes(source_name, runtime, result, frame)
+        detections = self._extract_tracked_person_boxes(source_name, runtime, result, frame, mode)
+        counts_started_ts = time.perf_counter()
         tracked_ids = {detection.track_id for detection in detections if detection.track_id is not None}
         person_count = len(tracked_ids) if tracked_ids else len(detections)
         intruder_count = person_count if mode == "night" or not self._uniform_detection_enabled() else 0
@@ -6778,6 +7335,8 @@ class InferenceWindow(QMainWindow):
             detection.is_intruder = mode == "night" or not self._uniform_detection_enabled()
             detection.uniform_match = None
             detection.label = "intruz" if detection.is_intruder else "pracownik"
+        self._profile_add("counts_labels", time.perf_counter() - counts_started_ts)
+        self._profile_add("postprocess", time.perf_counter() - postprocess_started_ts)
         return detections, person_count, intruder_count
 
     def _draw_person_boxes(
@@ -6833,12 +7392,14 @@ class InferenceWindow(QMainWindow):
         alert: bool,
         boxes: list[PersonDetection] | None = None,
     ) -> np.ndarray:
+        draw_started_ts = time.perf_counter()
         color = (0, 0, 255) if alert else (0, 185, 0)
         status = "ALERT" if alert else "OK"
         text = f"{source_name} | mode:{mode} | person:{person_count} | intruder:{intruder_count} | {status}"
 
         output = self._draw_person_boxes(frame, boxes)
         cv2.putText(output, text, (10, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.65, color, 2, cv2.LINE_AA)
+        self._profile_add("draw", time.perf_counter() - draw_started_ts)
         return output
 
     def _refresh_tile(self, source_name: str) -> None:
@@ -6918,6 +7479,7 @@ class InferenceWindow(QMainWindow):
         now_ts = time.perf_counter()
         self._update_load_shed_state(now_ts)
         self._maybe_adjust_live_timer_interval(now_ts)
+        self._maybe_flush_debug_profile()
 
         if not self._apply_async_inference_updates():
             return
@@ -8297,6 +8859,7 @@ class InferenceWindow(QMainWindow):
         self.config["uniform"] = dict(self.uniform_cfg)
         self.config["events"] = dict(self.events_cfg)
         self.config["runtime"] = dict(self.runtime_cfg)
+        self.config["debug"] = dict(self.debug_cfg)
         self.config.pop("sources", None)
 
         config_signature = json.dumps(self.config, sort_keys=True, ensure_ascii=True, default=str)
