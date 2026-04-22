@@ -14,7 +14,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -183,6 +183,31 @@ def _compute_region_color(
     return _bgr_to_hex(color), int(region_pixels.shape[0])
 
 
+def _mask_row_percentile_bounds(mask: np.ndarray) -> tuple[int, int, int, int] | None:
+    if getattr(mask, "ndim", 0) != 2 or mask.size == 0:
+        return None
+    row_counts = np.count_nonzero(mask, axis=1)
+    total = int(row_counts.sum())
+    if total <= 0:
+        return None
+
+    cumulative = np.cumsum(row_counts, dtype=np.int64)
+
+    def _locate(fraction: float) -> int:
+        threshold = max(0, min(total - 1, int(math.floor(float(fraction) * total))))
+        return int(np.searchsorted(cumulative, threshold, side="left"))
+
+    upper_start = _locate(0.20)
+    upper_end = _locate(0.60)
+    lower_start = upper_end
+    lower_end = _locate(0.95) + 1
+
+    upper_end = max(upper_start + 1, upper_end)
+    lower_start = max(upper_end, lower_start)
+    lower_end = max(lower_start + 1, lower_end)
+    return upper_start, upper_end, lower_start, lower_end
+
+
 def _clip_box_to_frame(
     x1: int,
     y1: int,
@@ -241,7 +266,14 @@ def _extract_mask_roi_for_detection(
         except Exception:  # noqa: BLE001
             return None
 
-    roi_mask = np.ascontiguousarray((roi_mask > 0).astype(np.uint8) * 255)
+    if roi_mask.dtype == np.bool_:
+        roi_mask = roi_mask.astype(np.uint8) * 255
+    elif roi_mask.dtype != np.uint8:
+        roi_mask = roi_mask > 0.5 if np.issubdtype(roi_mask.dtype, np.floating) else roi_mask > 0
+        roi_mask = roi_mask.astype(np.uint8) * 255
+    else:
+        roi_mask = np.where(roi_mask > 0, 255, 0).astype(np.uint8, copy=False)
+    roi_mask = np.ascontiguousarray(roi_mask)
     if not np.any(roi_mask):
         return None
     return roi_mask, clipped
@@ -592,6 +624,7 @@ class SourceRuntime:
     last_tick_ts: float = 0.0
     last_infer_ts: float = 0.0
     source_fps: float = 0.0
+    last_capture_frame_ts: float = 0.0
     playback_interval_sec: float = 0.0
     last_frame_due_ts: float = 0.0
     ui_fps: float = 0.0
@@ -626,10 +659,14 @@ class SourceRuntime:
     event_clip_started_wall_ts: float = 0.0
     event_last_seen_ts: float = 0.0
     event_max_person_count: int = 0
+    event_max_intruder_count: int = 0
     event_clip_temp_path: Path | None = None
     event_clip_writer: cv2.VideoWriter | None = None
     event_clip_frame_size: tuple[int, int] | None = None
     event_clip_frames_written: int = 0
+    event_clip_last_enqueue_ts: float = 0.0
+    event_prebuffer_frames: deque[tuple[float, np.ndarray]] = field(default_factory=deque)
+    event_prebuffer_last_store_ts: float = 0.0
     event_clip_generation: int = 0
     event_clip_failed: bool = False
     last_tracker_update_ts: float = 0.0
@@ -671,7 +708,12 @@ class SourceRuntime:
         self.event_clip_temp_path = None
         self.event_clip_frame_size = None
         self.event_clip_frames_written = 0
+        self.event_clip_last_enqueue_ts = 0.0
+        self.event_prebuffer_frames.clear()
+        self.event_prebuffer_last_store_ts = 0.0
         self.event_clip_started_wall_ts = 0.0
+        self.event_max_person_count = 0
+        self.event_max_intruder_count = 0
 
 
 @dataclass
@@ -1471,15 +1513,13 @@ class InferenceWindow(QMainWindow):
         self._uniform_recheck_iou = float(_clamp(float(self.runtime_cfg.get("uniform_recheck_iou", 0.85)), 0.2, 0.99))
         self._uniform_max_fresh_per_cycle = max(1, int(self.runtime_cfg.get("uniform_max_fresh_per_cycle", 2)))
         self._event_writer_cond = threading.Condition()
-        self._event_writer_queue: deque[tuple[str, int, np.ndarray]] = deque()
-        self._event_writer_pending: dict[tuple[str, int], int] = {}
-        self._event_writer_drop_notice_ts: dict[str, float] = {}
+        self._event_writer_queue: deque[tuple[str, int]] = deque()
+        self._event_writer_latest_frames: dict[tuple[str, int], np.ndarray] = {}
+        self._event_writer_prebuffer_frames: dict[tuple[str, int], deque[np.ndarray]] = {}
+        self._event_writer_queued_keys: set[tuple[str, int]] = set()
+        self._event_writer_inflight_keys: set[tuple[str, int]] = set()
         self._event_writer_stop = False
         self._event_writer_thread: threading.Thread | None = None
-        self._event_writer_max_pending_frames = max(
-            1,
-            int(self.runtime_cfg.get("event_writer_max_pending_frames", 8)),
-        )
         self._load_shed_level = 0.0
         self._load_shed_last_pressure_ts = 0.0
         self._load_shed_last_log_ts = 0.0
@@ -1498,6 +1538,7 @@ class InferenceWindow(QMainWindow):
         self.events_linger_seconds = max(0.0, float(self.events_cfg.get("linger_seconds", 1.5)))
         self.events_min_person_count = max(1, int(self.events_cfg.get("min_person_count", 1)))
         self.events_clip_fps = max(1.0, float(self.events_cfg.get("clip_fps", 30.0)))
+        self.events_prebuffer_seconds = max(0.0, float(self.events_cfg.get("prebuffer_seconds", 2.0)))
         self.events_save_annotated = bool(self.events_cfg.get("save_annotated_frame", True))
         self.events_once_per_streak = bool(self.events_cfg.get("once_per_streak", True))
         self.events_max_saved = max(0, int(self.events_cfg.get("max_saved_events", 300)))
@@ -2448,6 +2489,11 @@ class InferenceWindow(QMainWindow):
         self.events_clip_fps_spin.setRange(1, 120)
         self.events_clip_fps_spin.setSingleStep(1)
 
+        self.events_prebuffer_spin = QDoubleSpinBox()
+        self.events_prebuffer_spin.setRange(0.0, 10.0)
+        self.events_prebuffer_spin.setSingleStep(0.5)
+        self.events_prebuffer_spin.setDecimals(1)
+
         self.events_max_saved_spin = QSpinBox()
         self.events_max_saved_spin.setRange(0, 20000)
         self.events_max_saved_spin.setSpecialValueText("0 (bez limitu)")
@@ -2481,12 +2527,14 @@ class InferenceWindow(QMainWindow):
         events_grid.addWidget(self.events_min_person_spin, 4, 1)
         events_grid.addWidget(QLabel("FPS zapisu klipu:"), 5, 0)
         events_grid.addWidget(self.events_clip_fps_spin, 5, 1)
-        events_grid.addWidget(QLabel("Maks. liczba zapisanych zdarzen:"), 6, 0)
-        events_grid.addWidget(self.events_max_saved_spin, 6, 1)
-        events_grid.addWidget(save_annotated_row, 7, 0, 1, 2)
-        events_grid.addWidget(once_row, 8, 0, 1, 2)
-        events_grid.addWidget(QLabel("Folder zapisu zdarzen:"), 9, 0)
-        events_grid.addWidget(output_row_widget, 9, 1)
+        events_grid.addWidget(QLabel("Pre-event buffer (s):"), 6, 0)
+        events_grid.addWidget(self.events_prebuffer_spin, 6, 1)
+        events_grid.addWidget(QLabel("Maks. liczba zapisanych zdarzen:"), 7, 0)
+        events_grid.addWidget(self.events_max_saved_spin, 7, 1)
+        events_grid.addWidget(save_annotated_row, 8, 0, 1, 2)
+        events_grid.addWidget(once_row, 9, 0, 1, 2)
+        events_grid.addWidget(QLabel("Folder zapisu zdarzen:"), 10, 0)
+        events_grid.addWidget(output_row_widget, 10, 1)
 
         top_settings_row.addWidget(events_box, stretch=1)
         layout.addLayout(top_settings_row)
@@ -3868,6 +3916,7 @@ class InferenceWindow(QMainWindow):
         self.events_linger_spin.setValue(float(self.events_cfg.get("linger_seconds", 1.5)))
         self.events_min_person_spin.setValue(int(self.events_cfg.get("min_person_count", 1)))
         self.events_clip_fps_spin.setValue(int(round(float(self.events_cfg.get("clip_fps", 30.0)))))
+        self.events_prebuffer_spin.setValue(float(self.events_cfg.get("prebuffer_seconds", 2.0)))
         self.events_max_saved_spin.setValue(int(self.events_cfg.get("max_saved_events", 300)))
         self.events_save_annotated_checkbox.setChecked(bool(self.events_cfg.get("save_annotated_frame", True)))
         self.events_once_per_streak_checkbox.setChecked(bool(self.events_cfg.get("once_per_streak", True)))
@@ -3925,6 +3974,7 @@ class InferenceWindow(QMainWindow):
         self.events_linger_spin.valueChanged.connect(self._on_setting_changed)
         self.events_min_person_spin.valueChanged.connect(self._on_setting_changed)
         self.events_clip_fps_spin.valueChanged.connect(self._on_setting_changed)
+        self.events_prebuffer_spin.valueChanged.connect(self._on_setting_changed)
         self.events_max_saved_spin.valueChanged.connect(self._on_setting_changed)
         self.events_save_annotated_checkbox.toggled.connect(self._on_setting_changed)
         self.events_once_per_streak_checkbox.toggled.connect(self._on_setting_changed)
@@ -6078,11 +6128,19 @@ class InferenceWindow(QMainWindow):
         self,
         source_batch: list[str],
         frame_batch: list[np.ndarray],
+        *,
+        mode: str,
     ) -> tuple[list[str], list[np.ndarray]]:
         if not source_batch:
             return source_batch, frame_batch
 
         coalesce_ms = self._infer_batch_coalesce_ms
+        if mode == "night":
+            infer_interval_ms = 1000.0 / max(1.0, self._effective_model_target_fps())
+            night_floor_ms = min(12.0, max(6.0, infer_interval_ms * 0.20))
+            coalesce_ms = max(coalesce_ms, night_floor_ms)
+            if len(source_batch) == 1:
+                coalesce_ms = min(14.0, coalesce_ms + 2.0)
         target_size = self._effective_max_infer_per_tick()
         if coalesce_ms <= 0.0 or len(source_batch) >= target_size:
             return source_batch, frame_batch
@@ -6153,15 +6211,15 @@ class InferenceWindow(QMainWindow):
         while not self._infer_stop_event.is_set():
             if not self._infer_has_work_event.wait(0.05):
                 continue
+            mode = resolve_security_mode(self.security_cfg)
             source_batch, frame_batch = self._pull_inference_batch()
             if not source_batch:
                 continue
 
-            source_batch, frame_batch = self._coalesce_inference_batch(source_batch, frame_batch)
+            source_batch, frame_batch = self._coalesce_inference_batch(source_batch, frame_batch, mode=mode)
             self._profile_batch_size(len(source_batch))
 
             try:
-                mode = resolve_security_mode(self.security_cfg)
                 batch_results = self._predict_batch_for_mode(frame_batch, mode)
             except Exception as exc:  # noqa: BLE001
                 with self._infer_lock:
@@ -6264,7 +6322,7 @@ class InferenceWindow(QMainWindow):
             effective_model_fps = self._effective_model_target_fps()
             self._log(
                 "[warn] Wykryto przeciazenie zapisu klipow. "
-                "Tymczasowo ograniczam obciazenie "
+                "Writer klipow nie nadaza z enkodowaniem/zapisem na dysk. Tymczasowo ograniczam obciazenie "
                 f"(view_fps~{effective_view_fps:.1f}, model_fps~{effective_model_fps:.1f}) "
                 f"na co najmniej {self._load_shed_sticky_seconds:.0f}s."
             )
@@ -6437,6 +6495,16 @@ class InferenceWindow(QMainWindow):
                 stop_event.wait(0.05)
                 continue
 
+            now_ts = time.perf_counter()
+            if runtime.last_capture_frame_ts > 0.0:
+                frame_delta = max(1e-6, now_ts - runtime.last_capture_frame_ts)
+                measured_source_fps = 1.0 / frame_delta
+                if runtime.source_fps <= 0.0:
+                    runtime.source_fps = measured_source_fps
+                else:
+                    runtime.source_fps = _ema(runtime.source_fps, measured_source_fps, 0.35)
+            runtime.last_capture_frame_ts = now_ts
+
             with self._capture_lock:
                 runtime.capture_latest_frame = frame
                 runtime.capture_latest_seq += 1
@@ -6510,6 +6578,7 @@ class InferenceWindow(QMainWindow):
         runtime.capture = open_capture(runtime.source)
         ok = runtime.capture.isOpened()
         runtime.source_fps = 0.0
+        runtime.last_capture_frame_ts = 0.0
         runtime.playback_interval_sec = 0.0
         runtime.last_frame_due_ts = 0.0
         runtime.last_tick_ts = 0.0
@@ -6531,12 +6600,15 @@ class InferenceWindow(QMainWindow):
         runtime.last_decorated_capture_seq = 0
         runtime.last_decorated_infer_ts = 0.0
         runtime.no_frame_refresh_needed = True
+        runtime.event_prebuffer_frames.clear()
+        runtime.event_prebuffer_last_store_ts = 0.0
         runtime.person_visible_since_ts = 0.0
         runtime.person_visible_duration_sec = 0.0
         runtime.last_event_capture_ts = 0.0
         runtime.event_saved_in_streak = False
         runtime.event_last_seen_ts = 0.0
         runtime.event_max_person_count = 0
+        runtime.event_max_intruder_count = 0
         self._clear_async_state_for_source(source_name)
         with self._infer_lock:
             self.trackers.pop(source_name, None)
@@ -6628,7 +6700,7 @@ class InferenceWindow(QMainWindow):
         with self._model_lock:
             try:
                 results = self.model.predict(frames, **self.predict_kwargs)
-                return list(results)
+                return self._results_to_list(results)
             except Exception as exc:  # noqa: BLE001
                 if not self.compile_enabled:
                     raise
@@ -6652,7 +6724,7 @@ class InferenceWindow(QMainWindow):
                     pass
 
                 results = self.model.predict(frames, **self.predict_kwargs)
-                return list(results)
+                return self._results_to_list(results)
 
     @staticmethod
     def _tensor_like_to_torch(value: Any) -> torch.Tensor | None:
@@ -6679,6 +6751,12 @@ class InferenceWindow(QMainWindow):
             return np.asarray(value)
         except Exception:  # noqa: BLE001
             return None
+
+    @staticmethod
+    def _results_to_list(results: Any) -> list[Any]:
+        if isinstance(results, list):
+            return results
+        return list(results)
 
     def _extract_person_box_arrays(
         self,
@@ -6780,7 +6858,7 @@ class InferenceWindow(QMainWindow):
         predict_started_ts = time.perf_counter()
         if mode == "day" and self._uniform_detection_enabled() and self.day_seg_model is not None:
             with self._model_lock:
-                results = list(self.day_seg_model.predict(frames, **self.day_seg_predict_kwargs))
+                results = self._results_to_list(self.day_seg_model.predict(frames, **self.day_seg_predict_kwargs))
             self._profile_add("predict", time.perf_counter() - predict_started_ts, units=len(frames))
             return results
         results = self._predict_batch_with_fallback(frames)
@@ -6791,44 +6869,41 @@ class InferenceWindow(QMainWindow):
         detections, _keep_indices, _raw_box_array = self._extract_person_box_arrays(result)
         return detections
 
-    def _extract_person_segmentation_candidates(
+    def _extract_person_segmentation_masks(
         self,
         result: Any,
         pre_extracted: tuple[list[PersonDetection], np.ndarray | None] | None = None,
-    ) -> list[tuple[PersonDetection, np.ndarray | None]]:
+    ) -> tuple[list[PersonDetection], np.ndarray | None]:
         if pre_extracted is None:
             detections, keep_indices, _raw_box_array = self._extract_person_box_arrays(result)
         else:
             detections, keep_indices = pre_extracted
         if not detections:
-            return []
+            return [], None
 
         raw_masks = getattr(result, "masks", None)
-        mask_arrays: list[np.ndarray | None] = [None] * len(detections)
-        if raw_masks is not None:
-            try:
-                mask_data = raw_masks.data
-                mask_tensor = self._tensor_like_to_torch(mask_data)
-                if mask_tensor is not None and mask_tensor.ndim == 3:
-                    if keep_indices is not None and keep_indices.size > 0:
-                        index_tensor = torch.as_tensor(keep_indices, device=mask_tensor.device, dtype=torch.int64)
-                        index_tensor = index_tensor[index_tensor < int(mask_tensor.shape[0])]
-                        selected_masks_tensor = mask_tensor.index_select(0, index_tensor) if int(index_tensor.numel()) > 0 else None
-                    else:
-                        selected_masks_tensor = None
+        if raw_masks is None:
+            return detections, None
 
-                    if selected_masks_tensor is not None:
-                        selected_masks = self._tensor_like_to_numpy(selected_masks_tensor)
-                    else:
-                        selected_masks = None
+        try:
+            mask_tensor = self._tensor_like_to_torch(raw_masks.data)
+            if mask_tensor is None or mask_tensor.ndim != 3:
+                return detections, None
+            if keep_indices is None or keep_indices.size <= 0:
+                return detections, None
 
-                    if selected_masks is not None and selected_masks.ndim == 3:
-                        limit = min(len(mask_arrays), int(selected_masks.shape[0]))
-                        for index in range(limit):
-                            mask_arrays[index] = np.ascontiguousarray((selected_masks[index] > 0.5).astype(np.uint8) * 255)
-            except Exception:  # noqa: BLE001
-                pass
-        return list(zip(detections, mask_arrays))
+            index_tensor = torch.as_tensor(keep_indices, device=mask_tensor.device, dtype=torch.int64)
+            index_tensor = index_tensor[index_tensor < int(mask_tensor.shape[0])]
+            if int(index_tensor.numel()) <= 0:
+                return detections, None
+
+            selected_masks_tensor = mask_tensor.index_select(0, index_tensor)
+            selected_masks = self._tensor_like_to_numpy(selected_masks_tensor)
+            if selected_masks is None or selected_masks.ndim != 3:
+                return detections, None
+            return detections, np.ascontiguousarray(selected_masks)
+        except Exception:  # noqa: BLE001
+            return detections, None
 
     def _analyze_day_uniform_detections(
         self,
@@ -6839,12 +6914,11 @@ class InferenceWindow(QMainWindow):
         pre_extracted: tuple[list[PersonDetection], np.ndarray | None] | None = None,
     ) -> list[PersonDetection]:
         uniform_started_ts = time.perf_counter()
-        candidates = self._extract_person_segmentation_candidates(result, pre_extracted=pre_extracted)
-        if not candidates:
+        detections_only, selected_masks = self._extract_person_segmentation_masks(result, pre_extracted=pre_extracted)
+        if not detections_only:
             self._profile_add("uniform", time.perf_counter() - uniform_started_ts)
             return []
 
-        detections_only = [detection for detection, _mask in candidates]
         self._attach_track_ids_to_day_detections(detections_only, tracked_boxes)
 
         tolerance = float(self.uniform_cfg.get("color_tolerance", UNIFORM_COLOR_TOLERANCE_DEFAULT))
@@ -6862,7 +6936,7 @@ class InferenceWindow(QMainWindow):
 
         detections: list[PersonDetection] = []
         fresh_analysis_used = 0
-        for detection, seg_mask in candidates:
+        for index, detection in enumerate(detections_only):
             cache_entry = None
             if detection.track_id is not None:
                 cache_entry = source_memory_snapshot.get(int(detection.track_id))
@@ -6882,6 +6956,9 @@ class InferenceWindow(QMainWindow):
 
             fresh_analysis_used += 1
 
+            seg_mask = None
+            if selected_masks is not None and index < int(selected_masks.shape[0]):
+                seg_mask = selected_masks[index]
             mask_roi_info = _extract_mask_roi_for_detection(seg_mask, detection, frame.shape)
             if mask_roi_info is None:
                 detection.has_segmentation = False
@@ -6900,8 +6977,8 @@ class InferenceWindow(QMainWindow):
             frame_roi = frame[y1:y2, x1:x2]
             detection.has_segmentation = True
 
-            mask_rows = np.where(working_mask > 0)[0]
-            if mask_rows.size == 0:
+            bounds = _mask_row_percentile_bounds(working_mask)
+            if bounds is None:
                 detection.has_segmentation = False
                 detection.upper_match = None
                 detection.lower_match = None
@@ -6913,15 +6990,7 @@ class InferenceWindow(QMainWindow):
                 detections.append(detection)
                 continue
 
-            # Split body using segmentation mask geometry, not bbox height.
-            upper_start = int(np.percentile(mask_rows, 20))
-            upper_end = int(np.percentile(mask_rows, 60))
-            lower_start = int(np.percentile(mask_rows, 60))
-            lower_end = int(np.percentile(mask_rows, 95)) + 1
-
-            upper_end = max(upper_start + 1, upper_end)
-            lower_start = max(upper_end, lower_start)
-            lower_end = max(lower_start + 1, lower_end)
+            upper_start, upper_end, lower_start, lower_end = bounds
 
             upper_sample = _compute_region_color(
                 frame_roi,
@@ -7079,16 +7148,29 @@ class InferenceWindow(QMainWindow):
         return boxes
 
     def _bbox_iou(self, first: PersonDetection, second: PersonDetection) -> float:
-        inter_x1 = max(first.x1, second.x1)
-        inter_y1 = max(first.y1, second.y1)
-        inter_x2 = min(first.x2, second.x2)
-        inter_y2 = min(first.y2, second.y2)
+        return self._bbox_iou_coords(first.x1, first.y1, first.x2, first.y2, second.x1, second.y1, second.x2, second.y2)
+
+    @staticmethod
+    def _bbox_iou_coords(
+        ax1: int,
+        ay1: int,
+        ax2: int,
+        ay2: int,
+        bx1: int,
+        by1: int,
+        bx2: int,
+        by2: int,
+    ) -> float:
+        inter_x1 = max(ax1, bx1)
+        inter_y1 = max(ay1, by1)
+        inter_x2 = min(ax2, bx2)
+        inter_y2 = min(ay2, by2)
         if inter_x2 <= inter_x1 or inter_y2 <= inter_y1:
             return 0.0
 
         inter_area = float((inter_x2 - inter_x1) * (inter_y2 - inter_y1))
-        first_area = float(max(1, first.x2 - first.x1) * max(1, first.y2 - first.y1))
-        second_area = float(max(1, second.x2 - second.x1) * max(1, second.y2 - second.y1))
+        first_area = float(max(1, ax2 - ax1) * max(1, ay2 - ay1))
+        second_area = float(max(1, bx2 - bx1) * max(1, by2 - by1))
         union = first_area + second_area - inter_area
         if union <= 1e-6:
             return 0.0
@@ -7146,17 +7228,14 @@ class InferenceWindow(QMainWindow):
             return False
 
         try:
-            cached_detection = PersonDetection(
-                x1=int(cached_bbox[0]),
-                y1=int(cached_bbox[1]),
-                x2=int(cached_bbox[2]),
-                y2=int(cached_bbox[3]),
-                conf=float(detection.conf),
-            )
+            cx1 = int(cached_bbox[0])
+            cy1 = int(cached_bbox[1])
+            cx2 = int(cached_bbox[2])
+            cy2 = int(cached_bbox[3])
         except Exception:  # noqa: BLE001
             return False
 
-        if self._bbox_iou(detection, cached_detection) < self._uniform_recheck_iou:
+        if self._bbox_iou_coords(detection.x1, detection.y1, detection.x2, detection.y2, cx1, cy1, cx2, cy2) < self._uniform_recheck_iou:
             return False
 
         detection.has_segmentation = bool(entry.get("has_segmentation", False))
@@ -7220,6 +7299,10 @@ class InferenceWindow(QMainWindow):
                 entry = source_memory.get(track_id, {})
                 previous_score = float(entry.get("score", 0.0))
                 bad_streak = int(entry.get("bad_streak", 0))
+                previous_worker_streak = int(entry.get("worker_streak", 0))
+                worker_streak = previous_worker_streak
+                previous_is_intruder = bool(entry.get("is_intruder", True))
+                previous_last_seen = float(entry.get("last_seen_ts", 0.0))
 
                 false_count = int(detection.upper_match is False) + int(detection.lower_match is False)
                 true_count = int(detection.upper_match is True) + int(detection.lower_match is True)
@@ -7242,8 +7325,15 @@ class InferenceWindow(QMainWindow):
 
                 current_intruder = bool(detection.is_intruder)
                 bad_streak = bad_streak + 1 if current_intruder else 0
+                worker_streak = worker_streak + 1 if not current_intruder else 0
 
                 strong_worker_history = score >= self._uniform_memory_min_worker_score
+                recent_confirmed_worker = (
+                    not previous_is_intruder
+                    and previous_last_seen > 0.0
+                    and (now_ts - previous_last_seen) <= min(self._uniform_memory_ttl_sec, 2.5)
+                    and (previous_worker_streak >= 2 or previous_score >= self._uniform_memory_min_worker_score)
+                )
                 if current_intruder and strong_worker_history:
                     keep_as_worker = False
                     if false_count <= 1 and bad_streak <= self._uniform_memory_max_bad_streak:
@@ -7252,11 +7342,30 @@ class InferenceWindow(QMainWindow):
                         keep_as_worker = True
                     elif false_count == 0 and unknown_count >= 1:
                         keep_as_worker = True
+                    elif recent_confirmed_worker and false_count == 0 and unknown_count >= 1:
+                        keep_as_worker = True
+                    elif (
+                        recent_confirmed_worker
+                        and false_count <= 1
+                        and bad_streak <= (self._uniform_memory_max_bad_streak + 1)
+                        and int(detection.visible_section_count) <= 1
+                    ):
+                        keep_as_worker = True
+                    elif (
+                        recent_confirmed_worker
+                        and false_count == 2
+                        and bad_streak <= 1
+                        and float(detection.conf) < 0.75
+                        and int(detection.visible_section_count) <= 1
+                    ):
+                        keep_as_worker = True
 
                     if keep_as_worker:
                         detection.is_intruder = False
                         detection.uniform_match = True
                         detection.label = "pracownik"
+                        bad_streak = max(0, bad_streak - 1)
+                        worker_streak = max(worker_streak, previous_worker_streak + 1)
 
                 if detection.is_intruder:
                     detection.label = "intruz"
@@ -7266,6 +7375,7 @@ class InferenceWindow(QMainWindow):
                 source_memory[track_id] = {
                     "score": score,
                     "bad_streak": bad_streak,
+                    "worker_streak": worker_streak,
                     "last_seen_ts": now_ts,
                     "analysis_ts": float(entry.get("analysis_ts", now_ts)),
                     "analysis_bbox": entry.get("analysis_bbox", [int(detection.x1), int(detection.y1), int(detection.x2), int(detection.y2)]),
@@ -7298,23 +7408,12 @@ class InferenceWindow(QMainWindow):
                 mode,
                 pre_extracted=(pre_detections, pre_keep_indices, pre_raw_box_array),
             )
-            detections_for_uniform = [
-                PersonDetection(
-                    x1=int(item.x1),
-                    y1=int(item.y1),
-                    x2=int(item.x2),
-                    y2=int(item.y2),
-                    conf=float(item.conf),
-                    track_id=item.track_id,
-                )
-                for item in pre_detections
-            ]
             detections = self._analyze_day_uniform_detections(
                 source_name,
                 frame,
                 result,
                 tracked_boxes,
-                pre_extracted=(detections_for_uniform, pre_keep_indices),
+                pre_extracted=(pre_detections, pre_keep_indices),
             )
             self._apply_uniform_temporal_memory(source_name, detections)
 
@@ -7421,7 +7520,7 @@ class InferenceWindow(QMainWindow):
             view_fps = min(view_fps, source_fps)
         ai_fps = runtime.infer_fps
 
-        smooth_alpha = float(_clamp(float(self.runtime_cfg.get("view_fps_smoothing", 0.2)), 0.0, 1.0))
+        smooth_alpha = float(_clamp(float(self.runtime_cfg.get("fps_runtime_smoothing", 0.35)), 0.0, 1.0))
         if source_fps > 0.0:
             runtime.smoothed_source_fps = _ema(runtime.smoothed_source_fps, source_fps, smooth_alpha)
         if view_fps > 0.0:
@@ -7432,11 +7531,11 @@ class InferenceWindow(QMainWindow):
         source_fps = runtime.smoothed_source_fps or source_fps
         view_fps = runtime.smoothed_view_fps or view_fps
         ai_fps = runtime.smoothed_infer_fps or ai_fps
-        display_update_sec = max(0.10, float(self.runtime_cfg.get("fps_display_update_sec", 0.35)))
-        display_alpha = float(_clamp(float(self.runtime_cfg.get("fps_display_smoothing", 0.08)), 0.01, 1.0))
-        display_quant_step = max(0.1, float(self.runtime_cfg.get("fps_display_quant_step", 0.5)))
-        view_display_bias = float(_clamp(float(self.runtime_cfg.get("view_fps_display_bias", 1.03)), 1.0, 1.25))
-        ai_display_bias = float(_clamp(float(self.runtime_cfg.get("ai_fps_display_bias", 1.08)), 1.0, 1.35))
+        display_update_sec = max(0.05, float(self.runtime_cfg.get("fps_display_update_sec", 0.15)))
+        display_alpha = float(_clamp(float(self.runtime_cfg.get("fps_display_smoothing", 0.35)), 0.01, 1.0))
+        display_quant_step = max(0.1, float(self.runtime_cfg.get("fps_display_quant_step", 0.1)))
+        view_display_bias = float(_clamp(float(self.runtime_cfg.get("view_fps_display_bias", 1.0)), 0.8, 1.25))
+        ai_display_bias = float(_clamp(float(self.runtime_cfg.get("ai_fps_display_bias", 1.0)), 0.8, 1.35))
 
         if runtime.last_meta_fps_update_ts <= 0.0 or (now - runtime.last_meta_fps_update_ts) >= display_update_sec:
             runtime.display_source_fps = _ema(runtime.display_source_fps, source_fps, display_alpha)
@@ -7570,6 +7669,11 @@ class InferenceWindow(QMainWindow):
             self._maybe_capture_event_snapshot(
                 source_name=source_name,
                 runtime=runtime,
+                raw_frame=frame,
+                decorated_frame=runtime.last_output,
+            )
+            self._store_event_prebuffer_frame(
+                runtime,
                 raw_frame=frame,
                 decorated_frame=runtime.last_output,
             )
@@ -8366,14 +8470,22 @@ class InferenceWindow(QMainWindow):
         with self._event_writer_cond:
             self._event_writer_stop = False
             self._event_writer_queue.clear()
-            self._event_writer_pending.clear()
-            self._event_writer_drop_notice_ts.clear()
+            self._event_writer_latest_frames.clear()
+            self._event_writer_prebuffer_frames.clear()
+            self._event_writer_queued_keys.clear()
+            self._event_writer_inflight_keys.clear()
         self._event_writer_thread = threading.Thread(
             target=self._event_writer_loop,
             name="event-clip-writer",
             daemon=True,
         )
         self._event_writer_thread.start()
+
+    def _event_writer_schedule_key_locked(self, key: tuple[str, int]) -> None:
+        if key in self._event_writer_queued_keys:
+            return
+        self._event_writer_queue.append(key)
+        self._event_writer_queued_keys.add(key)
 
     def _stop_event_writer_thread(self) -> None:
         with self._event_writer_cond:
@@ -8385,8 +8497,10 @@ class InferenceWindow(QMainWindow):
             worker.join(timeout=1.5)
         with self._event_writer_cond:
             self._event_writer_queue.clear()
-            self._event_writer_pending.clear()
-            self._event_writer_drop_notice_ts.clear()
+            self._event_writer_latest_frames.clear()
+            self._event_writer_prebuffer_frames.clear()
+            self._event_writer_queued_keys.clear()
+            self._event_writer_inflight_keys.clear()
 
     def _event_writer_loop(self) -> None:
         while True:
@@ -8395,9 +8509,21 @@ class InferenceWindow(QMainWindow):
                     self._event_writer_cond.wait(timeout=0.2)
                 if self._event_writer_stop and not self._event_writer_queue:
                     return
-                source_name, generation, frame = self._event_writer_queue.popleft()
+                source_name, generation = self._event_writer_queue.popleft()
+                key = (source_name, generation)
+                self._event_writer_queued_keys.discard(key)
+                prebuffer = self._event_writer_prebuffer_frames.get(key)
+                frame = None
+                if prebuffer:
+                    frame = prebuffer.popleft()
+                    if not prebuffer:
+                        self._event_writer_prebuffer_frames.pop(key, None)
+                if frame is None:
+                    frame = self._event_writer_latest_frames.pop(key, None)
+                if frame is None:
+                    continue
+                self._event_writer_inflight_keys.add(key)
 
-            key = (source_name, generation)
             runtime = self.runtimes.get(source_name)
             if runtime is not None and runtime.event_clip_generation == generation and runtime.event_clip_writer is not None:
                 target_size = runtime.event_clip_frame_size or (frame.shape[1], frame.shape[0])
@@ -8416,73 +8542,83 @@ class InferenceWindow(QMainWindow):
                     )
 
             with self._event_writer_cond:
-                pending = int(self._event_writer_pending.get(key, 0))
-                if pending <= 1:
-                    self._event_writer_pending.pop(key, None)
-                else:
-                    self._event_writer_pending[key] = pending - 1
+                self._event_writer_inflight_keys.discard(key)
+                if key in self._event_writer_latest_frames or key in self._event_writer_prebuffer_frames:
+                    self._event_writer_schedule_key_locked(key)
                 self._event_writer_cond.notify_all()
-
-    def _drop_oldest_event_frame_locked(self, source_name: str, generation: int) -> bool:
-        if not self._event_writer_queue:
-            return False
-
-        updated_queue: deque[tuple[str, int, np.ndarray]] = deque()
-        removed = False
-        while self._event_writer_queue:
-            queued_source, queued_generation, queued_frame = self._event_writer_queue.popleft()
-            if not removed and queued_source == source_name and queued_generation == generation:
-                removed = True
-                continue
-            updated_queue.append((queued_source, queued_generation, queued_frame))
-        self._event_writer_queue = updated_queue
-        return removed
 
     def _enqueue_event_clip_frame(self, source_name: str, runtime: SourceRuntime, frame: np.ndarray) -> None:
         generation = int(runtime.event_clip_generation)
         key = (source_name, generation)
-        should_log_drop = False
         with self._event_writer_cond:
-            pending = int(self._event_writer_pending.get(key, 0))
-            increment_pending = True
-            if pending >= self._event_writer_max_pending_frames:
-                dropped = self._drop_oldest_event_frame_locked(source_name, generation)
-                if not dropped:
-                    last_notice_ts = float(self._event_writer_drop_notice_ts.get(source_name, 0.0))
-                    now_ts = time.perf_counter()
-                    if now_ts - last_notice_ts >= 2.0:
-                        self._event_writer_drop_notice_ts[source_name] = now_ts
-                        should_log_drop = True
-                    return
-                increment_pending = False
-                last_notice_ts = float(self._event_writer_drop_notice_ts.get(source_name, 0.0))
-                now_ts = time.perf_counter()
-                if now_ts - last_notice_ts >= 2.0:
-                    self._event_writer_drop_notice_ts[source_name] = now_ts
-                    should_log_drop = True
-
-            self._event_writer_queue.append((source_name, generation, frame.copy()))
-            if increment_pending:
-                self._event_writer_pending[key] = pending + 1
+            # Keep only the newest pending frame per clip so the writer never falls
+            # behind by encoding stale history when the UI/inference outruns disk/codec.
+            self._event_writer_latest_frames[key] = frame.copy()
+            self._event_writer_schedule_key_locked(key)
             self._event_writer_cond.notify()
-        if should_log_drop:
-            self._register_event_writer_pressure()
-            self._queue_async_notice(
-                f"[warn] Kolejka zapisu klipu zdarzenia jest pelna dla '{source_name}'. "
-                "Pomijam najstarsze klatki, aby UI pozostalo plynne. "
-                "Sprobuj zmniejszyc liczbe klatek (model_target_fps/view_target_fps), "
-                "rozdzielczosc lub liczbe aktywnych zrodel."
-            )
 
     def _wait_for_event_clip_flush(self, source_name: str, generation: int, timeout_sec: float = 0.35) -> None:
         key = (source_name, int(generation))
         deadline = time.perf_counter() + max(0.01, timeout_sec)
         with self._event_writer_cond:
-            while int(self._event_writer_pending.get(key, 0)) > 0:
+            while (
+                key in self._event_writer_inflight_keys
+                or key in self._event_writer_latest_frames
+                or key in self._event_writer_prebuffer_frames
+                or key in self._event_writer_queued_keys
+            ):
                 remaining = deadline - time.perf_counter()
                 if remaining <= 0.0:
                     break
                 self._event_writer_cond.wait(timeout=min(0.05, remaining))
+
+    def _trim_event_prebuffer_locked(self, runtime: SourceRuntime, now_ts: float) -> None:
+        keep_sec = max(0.0, float(self.events_prebuffer_seconds))
+        if keep_sec <= 0.0:
+            runtime.event_prebuffer_frames.clear()
+            return
+        cutoff_ts = now_ts - keep_sec
+        while runtime.event_prebuffer_frames and float(runtime.event_prebuffer_frames[0][0]) < cutoff_ts:
+            runtime.event_prebuffer_frames.popleft()
+
+    def _store_event_prebuffer_frame(
+        self,
+        runtime: SourceRuntime,
+        raw_frame: np.ndarray,
+        decorated_frame: np.ndarray | None,
+    ) -> None:
+        keep_sec = max(0.0, float(self.events_prebuffer_seconds))
+        if keep_sec <= 0.0:
+            runtime.event_prebuffer_frames.clear()
+            runtime.event_prebuffer_last_store_ts = 0.0
+            return
+
+        now_ts = time.perf_counter()
+        sample_interval_sec = 1.0 / max(1.0, float(self.events_clip_fps))
+        if runtime.event_prebuffer_last_store_ts > 0.0 and (now_ts - runtime.event_prebuffer_last_store_ts) < sample_interval_sec:
+            self._trim_event_prebuffer_locked(runtime, now_ts)
+            return
+
+        frame_to_store = decorated_frame if self.events_save_annotated and decorated_frame is not None else raw_frame
+        runtime.event_prebuffer_frames.append((now_ts, frame_to_store.copy()))
+        runtime.event_prebuffer_last_store_ts = now_ts
+        self._trim_event_prebuffer_locked(runtime, now_ts)
+
+    def _prime_event_prebuffer_for_clip(self, source_name: str, runtime: SourceRuntime) -> None:
+        keep_sec = max(0.0, float(self.events_prebuffer_seconds))
+        if keep_sec <= 0.0 or not runtime.event_prebuffer_frames:
+            return
+
+        key = (source_name, int(runtime.event_clip_generation))
+        with self._event_writer_cond:
+            if key in self._event_writer_prebuffer_frames:
+                return
+            buffered_frames = deque(frame.copy() for _ts, frame in runtime.event_prebuffer_frames)
+            if not buffered_frames:
+                return
+            self._event_writer_prebuffer_frames[key] = buffered_frames
+            self._event_writer_schedule_key_locked(key)
+            self._event_writer_cond.notify()
 
     def _clear_event_clip_state(self, runtime: SourceRuntime, *, delete_temp_file: bool) -> Path | None:
         if runtime.event_clip_writer is not None:
@@ -8503,6 +8639,7 @@ class InferenceWindow(QMainWindow):
 
         runtime.event_clip_frame_size = None
         runtime.event_clip_frames_written = 0
+        runtime.event_clip_last_enqueue_ts = 0.0
         runtime.event_clip_started_wall_ts = 0.0
         runtime.event_clip_generation += 1
         runtime.event_clip_failed = False
@@ -8524,6 +8661,7 @@ class InferenceWindow(QMainWindow):
         wall_ts = runtime.event_clip_started_wall_ts if runtime.event_clip_started_wall_ts > 0.0 else time.time()
         visible_sec = float(runtime.person_visible_duration_sec)
         max_person_count = int(runtime.event_max_person_count)
+        max_intruder_count = int(runtime.event_max_intruder_count)
         failed = bool(runtime.event_clip_failed)
         temp_path = self._clear_event_clip_state(runtime, delete_temp_file=False)
         if temp_path is None:
@@ -8585,7 +8723,7 @@ class InferenceWindow(QMainWindow):
             "source": source_name,
             "mode": runtime.mode,
             "persons": max_person_count,
-            "intruders": max_person_count,
+            "intruders": max_intruder_count,
             "visible_sec": visible_sec,
             "alert": bool(runtime.alert),
             "file": _to_relative_or_abs(output_path),
@@ -8598,6 +8736,7 @@ class InferenceWindow(QMainWindow):
         runtime.event_saved_in_streak = True
         runtime.event_last_seen_ts = 0.0
         runtime.event_max_person_count = 0
+        runtime.event_max_intruder_count = 0
 
         show_latest = bool(
             hasattr(self, "main_tabs")
@@ -8607,7 +8746,7 @@ class InferenceWindow(QMainWindow):
         self._refresh_events_table(select_newest=show_latest)
         self._log(
             f"Event saved: {source_name}, visible={visible_sec:.1f}s, "
-            f"persons={runtime.person_count}, intruders={runtime.intruder_count}, file={output_path}"
+            f"persons={max_person_count}, intruders={max_intruder_count}, file={output_path}"
         )
 
     def _ensure_event_clip_writer(self, source_name: str, runtime: SourceRuntime, frame: np.ndarray) -> bool:
@@ -8641,8 +8780,10 @@ class InferenceWindow(QMainWindow):
         runtime.event_clip_temp_path = temp_path
         runtime.event_clip_frame_size = frame_size
         runtime.event_clip_frames_written = 0
+        runtime.event_clip_last_enqueue_ts = 0.0
         runtime.event_clip_generation += 1
         runtime.event_clip_failed = False
+        self._prime_event_prebuffer_for_clip(source_name, runtime)
         return True
 
     def _update_event_visibility_state(self, source_name: str, runtime: SourceRuntime, now_ts: float) -> None:
@@ -8656,10 +8797,12 @@ class InferenceWindow(QMainWindow):
                 runtime.event_clip_started_wall_ts = time.time()
                 runtime.event_last_seen_ts = now_ts
                 runtime.event_max_person_count = int(visible_count)
+                runtime.event_max_intruder_count = int(runtime.intruder_count)
             else:
                 runtime.person_visible_duration_sec = max(0.0, now_ts - runtime.person_visible_since_ts)
                 runtime.event_last_seen_ts = now_ts
                 runtime.event_max_person_count = max(runtime.event_max_person_count, int(visible_count))
+                runtime.event_max_intruder_count = max(runtime.event_max_intruder_count, int(runtime.intruder_count))
             return
 
         if runtime.person_visible_since_ts > 0.0:
@@ -8681,6 +8824,7 @@ class InferenceWindow(QMainWindow):
         runtime.event_saved_in_streak = False
         runtime.event_last_seen_ts = 0.0
         runtime.event_max_person_count = 0
+        runtime.event_max_intruder_count = 0
 
     def _maybe_capture_event_snapshot(
         self,
@@ -8699,11 +8843,17 @@ class InferenceWindow(QMainWindow):
         if clip_frame is None:
             return
 
+        now_ts = time.perf_counter()
+        clip_interval_sec = 1.0 / max(1.0, float(self.events_clip_fps))
+        if runtime.event_clip_last_enqueue_ts > 0.0 and (now_ts - runtime.event_clip_last_enqueue_ts) < clip_interval_sec:
+            return
+
         if not self._ensure_event_clip_writer(source_name, runtime, clip_frame):
             return
 
         if runtime.event_clip_writer is None:
             return
+        runtime.event_clip_last_enqueue_ts = now_ts
         self._enqueue_event_clip_frame(source_name, runtime, clip_frame)
 
     # ---------- logs ----------
@@ -8809,6 +8959,7 @@ class InferenceWindow(QMainWindow):
         self.events_cfg["linger_seconds"] = float(self.events_linger_spin.value())
         self.events_cfg["min_person_count"] = int(self.events_min_person_spin.value())
         self.events_cfg["clip_fps"] = int(self.events_clip_fps_spin.value())
+        self.events_cfg["prebuffer_seconds"] = float(self.events_prebuffer_spin.value())
         self.events_cfg["max_saved_events"] = int(self.events_max_saved_spin.value())
         self.events_cfg["save_annotated_frame"] = bool(self.events_save_annotated_checkbox.isChecked())
         self.events_cfg["once_per_streak"] = bool(self.events_once_per_streak_checkbox.isChecked())
@@ -8821,6 +8972,7 @@ class InferenceWindow(QMainWindow):
         self.events_linger_seconds = max(0.0, float(self.events_cfg["linger_seconds"]))
         self.events_min_person_count = max(1, int(self.events_cfg["min_person_count"]))
         self.events_clip_fps = max(1.0, float(self.events_cfg["clip_fps"]))
+        self.events_prebuffer_seconds = max(0.0, float(self.events_cfg["prebuffer_seconds"]))
         self.events_max_saved = max(0, int(self.events_cfg["max_saved_events"]))
         self.events_save_annotated = bool(self.events_cfg["save_annotated_frame"])
         self.events_once_per_streak = bool(self.events_cfg["once_per_streak"])
