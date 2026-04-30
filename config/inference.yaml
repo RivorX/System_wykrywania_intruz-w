@@ -123,7 +123,7 @@ runtime:
 # === DEBUG ===
 # ------------------------------------------------------------
 debug:
-  enabled: true
+  enabled: false
   console: true
   profiling: true
   profile_interval_sec: 5.0
