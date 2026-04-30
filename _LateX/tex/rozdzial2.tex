@@ -6,17 +6,23 @@ W rozdziale przedstawiono wymagania dla systemu wykrywania intruzów opartego na
 \subsection{Wymagania funkcjonalne}
 \begin{itemize}
 \item System musi obsługiwać wiele źródeł obrazu, w szczególności kamery lokalne, pliki wideo oraz strumienie sieciowe.
+\item System musi umożliwiać skanowanie dostępnych kamer oraz dodawanie źródeł obrazu z poziomu interfejsu graficznego.
 \item System musi wykrywać osoby w obrazie z wykorzystaniem modelu detekcji obiektów oraz umożliwiać ich śledzenie pomiędzy kolejnymi klatkami.
 \item System musi pracować w dwóch trybach: dziennym oraz nocnym, przy czym wybór trybu może być realizowany automatycznie na podstawie harmonogramu lub ręcznie przez operatora.
-\item System musi wyznaczać dla wykrytej osoby obszar analizy ubioru na podstawie maski powiązanej z obramowaniem detekcji, tak aby możliwe było określenie dominującego koloru stroju.
-\item System musi umożliwiać zdefiniowanie wzorca ogólnego koloru stroju firmowego, do którego porównywany jest dominujący kolor ubioru wykrytej osoby.
-\item W trybie dziennym system musi oznaczać jako potencjalnego intruza tylko te osoby, których dominujący kolor stroju nie odpowiada przyjętemu wzorcowi ubioru firmowego.
+\item System musi wyznaczać dla wykrytej osoby obszar analizy ubioru na podstawie maski segmentacyjnej sylwetki, tak aby możliwe było określenie koloru górnej i dolnej części stroju.
+\item System musi umożliwiać zdefiniowanie wzorca koloru stroju firmowego, do którego porównywany jest ubiór wykrytej osoby.
+\item W trybie dziennym system musi oznaczać jako potencjalnego intruza osoby, których ubiór nie odpowiada przyjętemu wzorcowi ubioru firmowego.
 \item W trybie nocnym system musi traktować każdą wykrytą osobę jako potencjalny incydent, niezależnie od koloru ubioru.
+\item System musi umożliwiać definiowanie masek ignorowanych obszarów kadru dla wybranych źródeł obrazu.
 \item System musi pozwalać na konfigurację progów detekcji, parametrów alarmu oraz zasad archiwizacji zdarzeń z poziomu interfejsu operatora.
+\item System musi umożliwiać pobieranie i ładowanie różnych wariantów modeli YOLO z poziomu aplikacji, bez konieczności modyfikacji kodu źródłowego.
+\item System musi umożliwiać zapisywanie i wczytywanie presetów ustawień.
 \item System musi rejestrować informacje o incydencie, w szczególności czas wykrycia, identyfikator źródła, tryb pracy, liczbę wykrytych osób oraz zapisany materiał dowodowy.
-\item System musi archiwizować zdarzenia w postaci klatki lub klipu wideo, gdy osoba pozostaje widoczna przez zdefiniowany czas.
+\item System musi archiwizować zdarzenia w postaci klipu wideo, gdy osoba pozostaje widoczna przez zdefiniowany czas.
+\item System musi automatycznie ograniczać liczbę zapisanych zdarzeń zgodnie z limitem określonym w konfiguracji.
 \item System musi prezentować operatorowi podgląd na żywo z wielu źródeł oraz sygnalizować stan alarmowy dla wybranego źródła.
 \item System musi umożliwiać przegląd historii wykrytych zdarzeń wraz z podglądem zapisanego materiału.
+\item System musi umożliwiać odtwarzanie nagrań z plików wideo, przewijanie materiału oraz powiększanie obrazu.
 \end{itemize}
 
 \subsection{Wymagania niefunkcjonalne}
@@ -30,4 +36,5 @@ W rozdziale przedstawiono wymagania dla systemu wykrywania intruzów opartego na
 \item System powinien zapewniać modularną budowę, umożliwiającą dalsze rozszerzenie o bardziej zaawansowane metody segmentacji, analizy kolorów oraz klasyfikacji ubioru.
 \item System powinien zapewniać bezpieczeństwo danych oraz ograniczenie dostępu do zapisanych nagrań, logów i konfiguracji.
 \item Interfejs operatora powinien być czytelny, prosty w obsłudze i dostosowany do szybkiej oceny sytuacji alarmowej.
+\item System powinien umożliwiać łatwe porównanie wariantów modeli pod kątem dokładności i obciążenia GPU.
 \end{itemize}

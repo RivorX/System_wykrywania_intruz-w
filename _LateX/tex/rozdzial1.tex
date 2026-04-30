@@ -1,16 +1,17 @@
 \clearpage
 \section{Nazwa i opis projektu}		%1
 
-Projekt nosi nazwę \textbf{System wykrywania intruzów}. Jego celem jest zwiększenie bezpieczeństwa firmy poprzez automatyczną analizę obrazu z kamer monitoringu oraz szybkie wykrywanie sytuacji niepożądanych.
+Projekt nosi nazwę \textbf{System wykrywania intruzów}. Jego celem jest zwiększenie bezpieczeństwa obiektu poprzez automatyczną analizę obrazu z kamer monitoringu, plików wideo oraz strumieni sieciowych. System wspomaga operatora ochrony przez wykrywanie osób, klasyfikowanie ich jako pracowników lub potencjalnych intruzów oraz zapisywanie materiału dowodowego w przypadku wystąpienia zdarzenia alarmowego.
 
-System działa w oparciu o kamery rozmieszczone w wybranych strefach obiektu, takich jak wejścia, korytarze, magazyny oraz strefy ograniczonego dostępu. Obraz z kamer, a także z innych źródeł wideo, jest analizowany na bieżąco, a wykryte zdarzenia są klasyfikowane zgodnie z porą dnia oraz przyjętymi regułami bezpieczeństwa.
+System działa w oparciu o źródła obrazu rozmieszczone w wybranych strefach obiektu, takich jak wejścia, korytarze, magazyny, parkingi oraz strefy ograniczonego dostępu. Obraz jest analizowany na bieżąco, a wykryte zdarzenia są klasyfikowane zgodnie z trybem pracy, aktualnymi progami alarmu oraz konfiguracją modelu.
 
-Istotnym elementem projektu jest rozróżnienie sposobu działania systemu w zależności od trybu pracy. W ciągu dnia system analizuje wygląd wykrytych osób i porównuje dominujący kolor ubioru z ogólnym wzorcem stroju firmowego. W tym celu wykorzystywany jest obszar osoby wyznaczony na podstawie maski powiązanej z detekcją, co pozwala ograniczyć wpływ tła na analizę koloru. W ciągu nocy system przyjmuje bardziej restrykcyjne założenie i traktuje każdą wykrytą osobę jako potencjalnego intruza.
+Istotnym elementem projektu jest rozróżnienie sposobu działania systemu w zależności od pory dnia. W trybie dziennym aplikacja wykorzystuje model segmentacyjny YOLO, który wyznacza maskę sylwetki wykrytej osoby. Na podstawie tej maski pobierane są kolory górnej oraz dolnej części ubioru, a następnie porównywane z zaprogramowanym wzorcem stroju pracownika. Takie podejście ogranicza wpływ tła na analizę koloru i pozwala odróżnić pracowników od osób niepożądanych. W trybie nocnym system działa bardziej restrykcyjnie: wykorzystuje klasyczny model detekcji YOLO i traktuje każdą wykrytą osobę jako potencjalne naruszenie bezpieczeństwa.
 
 \begin{itemize}
+\item \textbf{Tryb dzienny}: system analizuje maskę sylwetki osoby i porównuje kolor ubioru z ustawionym wzorcem pracownika.
 \item \textbf{Tryb nocny}: każda wykryta osoba traktowana jest jako potencjalne naruszenie bezpieczeństwa.
-\item \textbf{Tryb dzienny}: system koncentruje się na identyfikacji osób, których ubiór nie odpowiada ogólnemu kolorowi stroju firmowego, a tym samym mogą być uznane za osoby niepożądane.
-\item \textbf{Reakcja systemu}: po wykryciu incydentu zapisywany jest czas zdarzenia oraz materiał dowodowy w postaci klatki lub klipu, a operator może otrzymać informację o alarmie.
+\item \textbf{Reakcja systemu}: po wykryciu incydentu zapisywany jest czas zdarzenia, źródło obrazu, tryb pracy, liczba osób oraz materiał dowodowy w postaci klipu wideo.
+\item \textbf{Obsługa przez operatora}: konfiguracja kamer, modeli, progów detekcji i archiwizacji odbywa się z poziomu graficznego interfejsu aplikacji.
 \end{itemize}
 
-Projekt stanowi bazę do dalszego rozwoju, między innymi o integrację z systemami kontroli dostępu, dokładniejszą analizę zachowań osób oraz rozbudowane raportowanie incydentów.
+Projekt stanowi bazę do dalszego rozwoju, między innymi o integrację z systemami kontroli dostępu, powiadomienia zewnętrzne, dokładniejszą analizę zachowań osób oraz rozbudowane raportowanie incydentów.

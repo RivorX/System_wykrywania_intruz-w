@@ -78,8 +78,13 @@
 % Inne
 % ------------------------------------------------------------------------
 \frenchspacing                      
-\hyphenation{ATP/-EMTP}             %dzielenie wyrazu w danym miejscu
+\hyphenation{ATP-EMTP}              %dzielenie wyrazu w danym miejscu
+\setlength{\headheight}{23pt}       %wymagane przez nagłówek fancyhdr
 \setlength{\parskip}{3pt}           %odstęp pomiędzy akapitami
+\setcounter{biburlnumpenalty}{9000} %łatwiejsze łamanie adresów URL w bibliografii
+\setcounter{biburlucpenalty}{9000}
+\setcounter{biburllcpenalty}{9000}
+\setlength{\emergencystretch}{2em}
 \linespread{1.3}                    %odstęp pomiędzy liniami (interlinia)
 \setcounter{tocdepth}{4}            %uwzględnianie w spisie treści czterech poziomów sekcji
 \setcounter{secnumdepth}{4}         %numerowanie do czwartego poziomu sekcji 

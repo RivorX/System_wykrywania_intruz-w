@@ -9,16 +9,20 @@ Projekt składa się z aplikacji inferencyjnej PyQt6 oraz skryptów do przygotow
 ## Najważniejsze możliwości
 
 - Obsługa wielu źródeł obrazu: kamery lokalne, pliki wideo i strumienie.
+- Skanowanie dostępnych kamer z aplikacji albo przez parametr `--scan-cameras`.
 - Detekcja osób modelem YOLO oraz śledzenie obiektów między klatkami.
 - Tryb dzień/noc z osobnymi regułami alarmu.
 - W trybie dziennym możliwość odróżniania pracownika od intruza na podstawie zaprogramowanego wzorca ubioru.
 - Tryb dzienny oparty o segmentację sylwetki: aplikacja wycina maskę osoby, pobiera z niej kolory ubioru i na tej podstawie rozpoznaje pracowników.
 - Tryb nocny oparty o standardową detekcję YOLO, gdzie wykryta osoba może od razu spełniać warunek alarmu.
 - Obsługa masek, czyli obszarów kadru ignorowanych przez AI.
-- Podgląd live w siatce kamer oraz tryb pełnoekranowy dla pojedynczego źródła.
+- Podgląd live w siatce kamer, zoom/pan obrazu oraz tryb pełnoekranowy dla pojedynczego źródła.
+- Wbudowany odtwarzacz nagrań z suwakiem czasu, pauzą, stopem, zoomem i przesuwaniem obrazu.
 - Archiwizacja wykryć do klipów wideo z pre-bufferem, czasem widoczności i cooldownem.
+- Automatyczne ograniczanie liczby zapisanych zdarzeń i czyszczenie najstarszych plików po przekroczeniu limitu.
 - Zakładka wykrytego ruchu z filtrowaniem zdarzeń, podglądem i otwieraniem zapisanych plików.
 - Panel ustawień do zmiany progów detekcji, modeli, FPS, zapisu zdarzeń i kolorów ubioru.
+- Zapisywanie i wczytywanie presetów ustawień z poziomu interfejsu.
 - Pobieranie nowych i starszych modeli YOLO bez znajomości kodu: użytkownik wybiera model w aplikacji, klika `Pobierz wybrany model` i może go od razu załadować.
 - Logi aplikacji z możliwością eksportu.
 - Skrypty do pobrania/przygotowania datasetu COCO `person` i treningu YOLO.
@@ -39,9 +43,15 @@ Zakładka podglądu pokazuje wszystkie aktywne źródła w siatce. Na obrazie wi
 
 ![Podgląd kamer](docs/działanie-kamer-2.png)
 
+Na kafelkach można powiększać obraz kółkiem myszy i przesuwać powiększony kadr przeciąganiem. Pojedyncze źródło można otworzyć w trybie pełnoekranowym, a wyjście z tego widoku działa przez `Esc`, `F11`, prawy klik albo przycisk zamknięcia.
+
+### Nagrania
+
+W zakładce `Podgląd kamer` znajduje się też widok `Nagrania`. Pozwala wczytać plik wideo, odtwarzać go, pauzować, wracać do początku, przewijać suwakiem oraz korzystać z zoomu i przesuwania kadru. Dzięki temu aplikacja służy nie tylko do live monitoringu, ale też do szybkiego sprawdzania materiału z pliku.
+
 ### Konfiguracja kamer
 
-W zakładce konfiguracji można dodawać źródła, włączać i wyłączać kamery, ustawiać start od losowego momentu dla wideo oraz zapisywać konfigurację. Źródła są przechowywane poza głównym plikiem `inference.yaml`, w katalogu ustawień aplikacji.
+W zakładce konfiguracji można dodawać źródła typu kamera, plik wideo albo stream, włączać i wyłączać kamery, ustawiać start od losowego momentu dla wideo oraz zapisywać konfigurację. Źródła są przechowywane poza głównym plikiem `inference.yaml`, w katalogu ustawień aplikacji.
 
 ![Konfiguracja kamer](docs/zakladka-konfiguracja-kamer.png)
 
@@ -78,7 +88,9 @@ Konfiguracja inferencji znajduje się w `config/inference.yaml`. Aplikacja obsł
 - `high`: wyższa dokładność kosztem FPS.
 - `custom`: ręcznie dobrany model, rozdzielczość, progi i limity detekcji.
 
-Modele można zmieniać bez edycji plików i bez znajomości programowania. W zakładce `Ustawienia` znajduje się zaawansowany wybór modelu: aplikacja pokazuje dostępne warianty, pozwala pobrać nowsze lub starsze modele YOLO jednym kliknięciem (`Pobierz wybrany model`), a potem załadować je do pracy. Dzięki temu można szybko porównać lekki model nano, domyślny profil medium albo cięższy wariant nastawiony na dokładność.
+Modele można zmieniać bez edycji plików i bez znajomości programowania. W zakładce `Ustawienia` znajduje się zaawansowany wybór modelu: aplikacja pokazuje katalog dostępnych wariantów, rozmiar pliku, źródło modelu i informację, czy model jest już pobrany. Można pobrać nowsze lub starsze modele YOLO jednym kliknięciem (`Pobierz wybrany model`), a potem od razu załadować je do pracy. Dzięki temu można szybko porównać lekki model nano, domyślny profil medium albo cięższy wariant nastawiony na dokładność.
+
+Ustawienia można zapisywać jako presety i później je wczytywać. To ułatwia szybkie przełączanie między konfiguracją demonstracyjną, oszczędną i dokładną bez ręcznego przepisywania wartości.
 
 Aktualna konfiguracja używa między innymi:
 
@@ -134,7 +146,11 @@ Jeżeli `torch.cuda.is_available()` zwraca `False`, środowisko używa CPU albo 
 python scripts/inference_app.py
 ```
 
+Skanowanie dostępnych kamer:
 
+```bash
+python scripts/inference_app.py --scan-cameras
+```
 
 Po uruchomieniu aplikacja może automatycznie wystartować w pełnym ekranie, zależnie od ustawień:
 
@@ -165,6 +181,8 @@ events:
 ```
 
 Indeks zdarzeń jest zapisywany razem z plikami, dzięki czemu zakładka `Wykryty ruch` może je filtrować i odtwarzać.
+
+Po przekroczeniu `max_saved_events` aplikacja usuwa najstarsze wpisy i odpowiadające im pliki, więc katalog zdarzeń nie rośnie bez końca. Zdarzenia można też wyczyścić ręcznie z poziomu zakładki `Wykryty ruch`.
 
 ## Trening modelu
 
