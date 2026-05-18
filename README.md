@@ -1,8 +1,8 @@
 # System wykrywania intruzów
 
-Desktopowa aplikacja do monitoringu wielu kamer i plików wideo, oparta o modele YOLO. System wykrywa osoby, rozróżnia tryb dzienny i nocny, oznacza potencjalnych intruzów, zapisuje klipy zdarzeń oraz pozwala konfigurować źródła obrazu, maski ignorowanych obszarów i parametry modelu bez ręcznego grzebania w kodzie.
+Desktopowa aplikacja do monitoringu wielu kamer i plików wideo, oparta o modele YOLO. System wykrywa osoby, rozróżnia tryb dzienny i nocny, oznacza potencjalnych intruzów, zapisuje klipy zdarzeń oraz pozwala konfigurować źródła obrazu, maski ignorowanych obszarów i parametry modelu bez ręcznego grzebania w kodzie. Aplikacja wspomaga operatora ochrony: nie zastępuje decyzji człowieka, ale ogranicza ręczne przeglądanie obrazu i ułatwia szybkie wychwycenie zdarzeń wymagających uwagi.
 
-Projekt składa się z aplikacji inferencyjnej PyQt6 oraz skryptów do przygotowania danych i treningu modelu.
+Projekt składa się z aplikacji inferencyjnej PyQt6 oraz skryptów do przygotowania danych i treningu modelu. Rozwiązanie działa lokalnie na stanowisku operatora i pozwala dobrać konfigurację do dostępnego sprzętu, od lżejszego modelu nano po większe warianty nastawione na dokładność.
 
 ![Podgląd wielu kamer z detekcją intruzów](docs/działanie-kamer-1.png)
 
@@ -33,7 +33,17 @@ Aplikacja pracuje w osobnym oknie PyQt6. Podgląd kamer działa niezależnie od 
 
 W trybie nocnym działa klasyczny model YOLO do detekcji osób: jeśli ktoś pojawi się w kadrze, system może potraktować go jako intruza według progów alarmu. W dzień aplikacja przełącza się na wariant segmentacyjny. Model wycina maskę sylwetki, a system pobiera z tej maski kolor górnej i dolnej części ubioru. Jeżeli ubiór pasuje do zaprogramowanego wzorca, osoba jest oznaczana jako `pracownik`; w przeciwnym razie jako `intruz`.
 
-![Detekcja po zmianie ustawień](docs/po-zmianie-wykladu-kamera.png)
+Poniższy przykład pokazuje scenariusz po zmianie wzorca ubioru pracownika na czarną górę i niebieskawe spodnie. Najpierw w ustawieniach zapisano nowy wzorzec, a następnie kamera potwierdziła poprawną klasyfikację osoby jako `pracownik`.
+
+![Ustawiony wzorzec ubioru: czarna góra i niebieskawe spodnie](docs/po-zmianie-wykladu-ustawienia.png)
+
+![Poprawna klasyfikacja pracownika po zmianie wzorca ubioru](docs/po-zmianie-wykladu-kamera.png)
+
+## Technologie i założenia
+
+System został napisany w Pythonie. Modele YOLO są obsługiwane przez Ultralytics, a uruchamianie inferencji na CPU lub GPU odbywa się z użyciem PyTorch. OpenCV odpowiada za odczyt obrazu z kamer, plików wideo i strumieni oraz za zapis klipów zdarzeń. Interfejs desktopowy przygotowano w PyQt6, a konfigurację zapisano w plikach YAML, aby parametry aplikacji były czytelne i możliwe do zmiany bez modyfikowania kodu.
+
+Najważniejsze założenia techniczne to praca na wielu źródłach obrazu, niskie opóźnienie podglądu, możliwość przełączania modeli YOLO, obsługa wzorca ubioru w trybie dziennym oraz archiwizacja zdarzeń z limitem liczby zapisanych materiałów.
 
 ## Ekrany aplikacji
 
@@ -69,7 +79,7 @@ Zakładka `Wykryty ruch` prezentuje zapisane zdarzenia. Dostępne są filtry po 
 
 ### Ustawienia
 
-Panel ustawień pozwala zmienić reguły alarmu, archiwizację zdarzeń, profil detekcji YOLO, modele dzienne/nocne, urządzenie GPU/CPU, FP16, kompilację Torch oraz wzorzec ubioru dziennego.
+Panel ustawień pozwala zmienić reguły alarmu, archiwizację zdarzeń, profil detekcji YOLO, modele dzienne/nocne, urządzenie GPU/CPU, FP16, kompilację Torch oraz wzorzec ubioru dziennego. Wzorzec może być dopasowany do aktualnego stroju pracowników, na przykład do czarnej górnej części ubioru i niebieskawych spodni.
 
 ![Ustawienia aplikacji](docs/zakladka-ustawienia.png)
 
@@ -103,19 +113,19 @@ Aktualna konfiguracja używa między innymi:
 - automatycznego trybu dzień/noc w godzinach 22:00-06:00,
 - zapisu zdarzeń do `logs/app/events`.
 
-Domyślnym kompromisem dla aplikacji jest profil `medium`, oparty o model z rodziny `yolo26s`. Model `nano` był testowany jako lżejsza alternatywa, żeby pokazać, jak mocno można ograniczyć użycie GPU przy zachowaniu działania systemu na wielu źródłach.
+Domyślnym kompromisem dla aplikacji jest profil `medium`, oparty o model z rodziny `yolo26s`. Model `nano` był testowany jako lżejsza alternatywa dla standardowego modelu, żeby pokazać, jak mocno można ograniczyć użycie GPU przy zachowaniu działania systemu na wielu źródłach.
 
-![Alternatywny profil nano zamiast domyślnego medium](docs/nano-model-ustawienia.png)
+![Włączony model nano w ustawieniach aplikacji](docs/nano-model-ustawienia.png)
 
-Na lżejszym modelu nano aplikacja nadal wykrywa osoby i obsługuje wiele kamer, ale robi to z mniejszym kosztem obliczeniowym niż ustawienia medium/high.
+Na lżejszym modelu nano aplikacja nadal wykrywa osoby i obsługuje wiele kamer, ale robi to z mniejszym kosztem obliczeniowym niż ustawienia medium/high. Zrzut z kamer pokazuje wydajność i zachowanie systemu po przełączeniu na ten wariant.
 
 ![Podgląd kamer na modelu nano](docs/nano-model-kamery.png)
 
 ## Wydajność
 
-Wydajność zależy od modelu, rozdzielczości `imgsz`, liczby źródeł i GPU. Domyślny profil `medium` jest balansem między jakością i płynnością, natomiast `nano` służy jako wariant oszczędny: znacząco zmniejsza użycie GPU, kosztem mniejszego modelu i potencjalnie słabszej detekcji w trudniejszych kadrach.
+Wydajność zależy od modelu, rozdzielczości `imgsz`, liczby źródeł i GPU. Domyślny profil `medium` jest balansem między jakością i płynnością, natomiast `nano` służy jako wariant oszczędny: znacząco zmniejsza użycie GPU, kosztem mniejszego modelu i potencjalnie słabszej detekcji w trudniejszych kadrach. Zrzut `nano-model-cpuGpu-usage` pokazuje użycie CPU/GPU podczas pracy na modelu nano, czyli wyraźnie mniejsze obciążenie GPU niż przy większym modelu.
 
-![Niższe użycie CPU/GPU po przełączeniu na model nano](docs/nano-model-cpuGpu-usage.png)
+![Pomiar użycia CPU/GPU podczas pracy na modelu nano](docs/nano-model-cpuGpu-usage.png)
 
 Przy wyższych ustawieniach detekcji rośnie obciążenie GPU/CPU, szczególnie przy większej rozdzielczości i wielu źródłach.
 
