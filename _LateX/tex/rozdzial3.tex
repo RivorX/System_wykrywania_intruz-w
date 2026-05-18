@@ -3,20 +3,28 @@
 
 W rozdziale przedstawiono najważniejsze technologie wykorzystane w projekcie oraz ogólną architekturę aplikacji. System został zaprojektowany jako aplikacja desktopowa, ponieważ taki sposób działania pozwala operatorowi uruchomić monitoring lokalnie, bez konieczności wdrażania serwera WWW lub dodatkowej infrastruktury sieciowej.
 
-\subsection{Zastosowane technologie}
+\subsection{Zastosowane technologie i biblioteki}
 
-Do budowy systemu wykorzystano język Python oraz zestaw bibliotek przeznaczonych do przetwarzania obrazu, uczenia maszynowego i tworzenia interfejsów graficznych. Dobór bibliotek oparto na ich zastosowaniu w zadaniach detekcji obiektów, przetwarzania obrazu i budowy aplikacji desktopowych. Najważniejsze technologie to:
+Do budowy systemu wykorzystano język Python oraz zestaw bibliotek przeznaczonych do przetwarzania obrazu, uczenia maszynowego i tworzenia interfejsów graficznych. Dobór bibliotek oparto na ich zastosowaniu w zadaniach detekcji obiektów, przetwarzania obrazu i budowy aplikacji desktopowych. Ważne było również to, aby użyte narzędzia pozwalały uruchomić aplikację lokalnie, obsłużyć wiele źródeł obrazu i wygodnie zmieniać parametry modeli bez przebudowy całego projektu.
 
 \begin{itemize}
-\item \textbf{Python} -- główny język implementacji aplikacji, skryptów treningowych oraz narzędzi pomocniczych.
+\item \textbf{Python} -- główny język implementacji aplikacji, skryptów treningowych oraz narzędzi pomocniczych \cite{pythondocs}.
 \item \textbf{Ultralytics YOLO} -- biblioteka używana do detekcji osób, segmentacji sylwetek oraz obsługi wariantów modeli YOLO. Rodzina YOLO została zaprojektowana z myślą o detekcji w czasie rzeczywistym \cite{redmon2016yolo}, a implementacja Ultralytics udostępnia między innymi zadania detekcji, segmentacji i trackingu \cite{ultralyticsdocs}.
 \item \textbf{PyTorch} -- środowisko uruchomieniowe dla modeli głębokiego uczenia, z możliwością pracy na GPU \cite{paszke2019pytorch,pytorchdocs}.
 \item \textbf{OpenCV} -- biblioteka odpowiedzialna za odczyt obrazu z kamer, plików wideo i strumieni, a także za zapis klipów zdarzeń \cite{opencvdocs}.
 \item \textbf{PyQt6} -- biblioteka użyta do stworzenia graficznego interfejsu operatora \cite{pyqtdocs}.
-\item \textbf{YAML} -- format plików konfiguracyjnych, wykorzystywany do przechowywania ustawień inferencji, treningu i datasetu.
+\item \textbf{YAML} -- format plików konfiguracyjnych, wykorzystywany do przechowywania ustawień inferencji, treningu i datasetu \cite{yamlspec}.
 \end{itemize}
 
 Dobór technologii wynikał z potrzeby połączenia kilku obszarów: detekcji obiektów w czasie zbliżonym do rzeczywistego, wygodnego interfejsu użytkownika oraz możliwości późniejszego treningu i wymiany modeli.
+
+\subsection{Zakres wykorzystania narzędzi}
+
+Python pełni rolę języka łączącego wszystkie części systemu. W aplikacji odpowiada za logikę interfejsu, obsługę konfiguracji, sterowanie wątkami odczytu obrazu, komunikację z modelem oraz zapis zdarzeń. Dzięki temu większość funkcji systemu znajduje się w jednym środowisku uruchomieniowym, co ułatwia rozwój projektu i późniejsze utrzymanie.
+
+Ultralytics YOLO wykorzystano w dwóch wariantach pracy. W trybie nocnym używany jest model detekcyjny, którego zadaniem jest znalezienie osób w obrazie. W trybie dziennym używany jest model segmentacyjny, ponieważ oprócz ramki osoby potrzebna jest również maska sylwetki. Maska pozwala ograniczyć analizę koloru do obszaru człowieka, a nie do tła znajdującego się za nim. PyTorch odpowiada za uruchamianie modelu na CPU lub GPU, natomiast OpenCV obsługuje pobieranie klatek, operacje na obrazie oraz zapis materiału wideo.
+
+PyQt6 wykorzystano do stworzenia interfejsu operatora. Aplikacja zawiera zakładki podglądu kamer, konfiguracji źródeł obrazu, historii wykryć, ustawień oraz logów. YAML zastosowano jako format konfiguracji, ponieważ dobrze nadaje się do zapisu parametrów czytelnych dla człowieka: nazw modeli, progów detekcji, limitów wydajności, ustawień archiwizacji i wzorca ubioru.
 
 \subsection{Ogólna architektura}
 

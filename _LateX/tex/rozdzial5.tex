@@ -30,14 +30,21 @@ Aplikację sprawdzono na kilku jednoczesnych źródłach wideo. System poprawnie
 \label{fig:test-wiele-zrodel}
 \end{figure}
 
-\subsection{Test trybu dziennego i masek}
+\subsection{Test trybu dziennego, wzorca ubioru i masek}
 
-Tryb dzienny wykorzystuje model segmentacyjny do wyznaczenia maski sylwetki. Na podstawie tej maski aplikacja pobiera kolory ubioru i porównuje je z ustawionym wzorcem. Testy potwierdziły, że takie podejście pozwala ograniczyć wpływ tła na analizę koloru. Funkcja masek ignorowanych obszarów pozwoliła dodatkowo wykluczyć fragmenty kadru, które nie powinny brać udziału w detekcji. Efekt działania po zmianie ustawień modelu i progów pokazano na rysunku \ref{fig:test-zmiana-ustawien}.
+Tryb dzienny wykorzystuje model segmentacyjny do wyznaczenia maski sylwetki. Na podstawie tej maski aplikacja pobiera kolory ubioru i porównuje je z ustawionym wzorcem. Testy potwierdziły, że takie podejście pozwala ograniczyć wpływ tła na analizę koloru. W jednym ze scenariuszy zmieniono wzorzec stroju pracownika na czarną górną część ubioru oraz niebieskawe spodnie, co pokazano na rysunku \ref{fig:test-zmiana-wzorca}. Po zastosowaniu tej konfiguracji system poprawnie rozpoznał osobę spełniającą nowy wzorzec jako pracownika, co przedstawia rysunek \ref{fig:test-zmiana-ustawien}. Funkcja masek ignorowanych obszarów pozwoliła dodatkowo wykluczyć fragmenty kadru, które nie powinny brać udziału w detekcji.
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.95\textwidth]{rys/po-zmianie-wykladu-ustawienia.png}
+\caption{Ustawienie wzorca ubioru dziennego na czarną górę i niebieskawe spodnie.}
+\label{fig:test-zmiana-wzorca}
+\end{figure}
 
 \begin{figure}[H]
 \centering
 \includegraphics[width=0.95\textwidth]{rys/po-zmianie-wykladu-kamera.png}
-\caption{Przykład działania systemu po zmianie ustawień modelu i progów detekcji.}
+\caption{Poprawna klasyfikacja osoby jako pracownika po zmianie wzorca ubioru.}
 \label{fig:test-zmiana-ustawien}
 \end{figure}
 
@@ -49,19 +56,26 @@ Istotnym elementem jest limit \texttt{max\_saved\_events}. Po przekroczeniu tego
 
 \subsection{Porównanie modeli i obciążenia sprzętu}
 
-Aplikacja pozwala łatwo porównywać różne warianty modeli YOLO. Domyślnym kompromisem jest profil \textit{medium}, który łączy akceptowalną dokładność z rozsądnym obciążeniem sprzętu. Model nano został przetestowany jako lżejsza alternatywa. Jego ustawienia pokazano na rysunku \ref{fig:nano-ustawienia}. Użycie tego wariantu zmniejsza obciążenie GPU, co może być przydatne przy słabszym sprzęcie lub większej liczbie kamer. Przykład niższego zużycia zasobów przedstawia rysunek \ref{fig:nano-wydajnosc}.
+Aplikacja pozwala łatwo porównywać różne warianty modeli YOLO. Domyślnym kompromisem jest profil \textit{medium}, który łączy akceptowalną dokładność z rozsądnym obciążeniem sprzętu. Model nano został przetestowany jako lżejsza alternatywa dla standardowego modelu. Konfigurację z włączonym modelem nano pokazano na rysunku \ref{fig:nano-ustawienia}. W tym wariancie system nadal obsługuje kilka źródeł obrazu i wykonuje detekcję osób, co przedstawia rysunek \ref{fig:nano-kamery}. Jednocześnie, ze względu na mniejszy model, użycie GPU jest wyraźnie niższe niż przy większych wariantach YOLO. Pomiar obciążenia CPU i GPU podczas pracy modelu nano przedstawiono na rysunku \ref{fig:nano-wydajnosc}.
 
 \begin{figure}[H]
 \centering
 \includegraphics[width=0.95\textwidth]{rys/nano-model-ustawienia.png}
-\caption{Przykład ustawień lżejszego modelu nano jako alternatywy dla profilu medium.}
+\caption{Włączony model nano w ustawieniach aplikacji.}
 \label{fig:nano-ustawienia}
 \end{figure}
 
 \begin{figure}[H]
 \centering
+\includegraphics[width=0.95\textwidth]{rys/nano-model-kamery.png}
+\caption{Działanie systemu na wielu źródłach obrazu po przełączeniu na model nano.}
+\label{fig:nano-kamery}
+\end{figure}
+
+\begin{figure}[H]
+\centering
 \includegraphics[width=0.95\textwidth]{rys/nano-model-cpuGpu-usage.png}
-\caption{Niższe użycie CPU i GPU po przełączeniu na lżejszy model nano.}
+\caption{Pomiar użycia CPU i GPU podczas pracy na modelu nano, pokazujący niższe obciążenie GPU niż przy większym modelu.}
 \label{fig:nano-wydajnosc}
 \end{figure}
 

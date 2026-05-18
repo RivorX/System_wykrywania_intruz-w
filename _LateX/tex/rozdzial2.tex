@@ -3,6 +3,8 @@
 
 W rozdziale przedstawiono wymagania dla systemu wykrywania intruzów opartego na analizie obrazu z kamer, plików wideo oraz strumieni sieciowych. Celem systemu jest wspomaganie ochrony obiektu poprzez automatyczne wykrywanie obecności osób, ocenę zgodności ubioru z przyjętym wzorcem stroju firmowego, archiwizację zdarzeń oraz szybkie przekazywanie informacji operatorowi.
 
+Wymagania podzielono na funkcjonalne i niefunkcjonalne. Pierwsza grupa opisuje czynności, które aplikacja musi wykonywać z punktu widzenia operatora, na przykład obsługę kamer, klasyfikację osób i zapis zdarzeń. Druga grupa dotyczy jakości działania systemu: wydajności, stabilności, czytelności interfejsu, możliwości konfiguracji oraz dalszej rozbudowy. Taki podział ułatwia późniejszą ocenę, czy system spełnia zarówno założenia użytkowe, jak i techniczne.
+
 \subsection{Wymagania funkcjonalne}
 \begin{itemize}
 \item System musi obsługiwać wiele źródeł obrazu, w szczególności kamery lokalne, pliki wideo oraz strumienie sieciowe.
@@ -24,6 +26,14 @@ W rozdziale przedstawiono wymagania dla systemu wykrywania intruzów opartego na
 \item System musi umożliwiać przegląd historii wykrytych zdarzeń wraz z podglądem zapisanego materiału.
 \item System musi umożliwiać odtwarzanie nagrań z plików wideo, przewijanie materiału oraz powiększanie obrazu.
 \end{itemize}
+
+\subsection{Założenia użytkowe i techniczne}
+
+System został zaprojektowany z myślą o pracy na stanowisku operatora ochrony. Oznacza to, że najważniejsze operacje powinny być dostępne z poziomu interfejsu graficznego: dodanie kamery, zmiana modelu, ustawienie wzorca ubioru, przegląd historii zdarzeń oraz eksport logów. Operator nie powinien być zmuszony do ręcznej modyfikacji kodu źródłowego ani do uruchamiania oddzielnych skryptów tylko po to, aby zmienić podstawowe parametry pracy aplikacji.
+
+Drugim założeniem była możliwość dopasowania obciążenia systemu do dostępnego sprzętu. Z tego powodu wymagania obejmują obsługę różnych wariantów modeli YOLO, konfigurację rozdzielczości inferencji, limitu FPS modelu, progów detekcji oraz liczby maksymalnych wykryć. Pozwala to porównywać warianty nastawione na dokładność z wariantami oszczędnymi, takimi jak model nano. W praktyce jest to istotne, ponieważ aplikacja może pracować zarówno na pojedynczym źródle obrazu, jak i na kilku kamerach jednocześnie.
+
+Wymagania uwzględniają również trwałość danych zdarzeń. System powinien zapisywać tylko te informacje, które są potrzebne do późniejszej analizy incydentu: czas, źródło obrazu, tryb pracy, liczbę osób, liczbę intruzów oraz ścieżkę do materiału wideo. Jednocześnie aplikacja musi ograniczać liczbę zapisanych zdarzeń, aby katalog archiwum nie rozrastał się bez kontroli podczas długotrwałej pracy.
 
 \subsection{Wymagania niefunkcjonalne}
 \begin{itemize}

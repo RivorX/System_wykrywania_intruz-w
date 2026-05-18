@@ -3,6 +3,8 @@
 
 W rozdziale opisano najważniejsze elementy zaimplementowanej aplikacji. Szczególny nacisk położono na funkcje dostępne z poziomu interfejsu operatora, ponieważ założeniem projektu było stworzenie narzędzia możliwego do obsługi bez znajomości kodu źródłowego.
 
+Aplikacja łączy część wizualną, logikę inferencji oraz mechanizmy archiwizacji. Interfejs został przygotowany w PyQt6 \cite{pyqtdocs}, natomiast odczyt obrazu i zapis klipów korzystają z OpenCV \cite{opencvdocs}. Modele YOLO uruchamiane przez Ultralytics i PyTorch odpowiadają za detekcję oraz segmentację osób \cite{ultralyticsdocs,pytorchdocs}. Dzięki temu operator pracuje w jednym oknie, a szczegóły techniczne, takie jak wybór modelu, urządzenia obliczeniowego lub parametrów detekcji, są dostępne w panelu ustawień.
+
 \subsection{Interfejs operatora}
 
 Interfejs aplikacji został podzielony na główne zakładki:
@@ -15,7 +17,7 @@ Interfejs aplikacji został podzielony na główne zakładki:
 \item \textbf{Logi} -- prezentuje komunikaty diagnostyczne aplikacji oraz umożliwia ich eksport.
 \end{itemize}
 
-Główny widok aplikacji przedstawiono na rysunku \ref{fig:podglad-kamer}. Każda kamera ma osobny kafelek, na którym widoczny jest tryb pracy, liczba osób, liczba intruzów, status alarmu oraz metryki wydajności.
+Główny widok aplikacji przedstawiono na rysunku \ref{fig:podglad-kamer}. Każda kamera ma osobny kafelek, na którym widoczny jest tryb pracy, liczba osób, liczba intruzów, status alarmu oraz metryki wydajności. Taki układ pozwala szybko ocenić sytuację na wielu źródłach jednocześnie. Operator widzi zarówno wynik klasyfikacji, jak i informację, czy dane źródło pracuje poprawnie oraz z jaką płynnością jest analizowane.
 
 \begin{figure}[H]
 \centering
@@ -34,7 +36,7 @@ Aplikacja obsługuje trzy typy źródeł:
 \item strumienie sieciowe.
 \end{itemize}
 
-Operator może przeskanować dostępne kamery, dodać plik wideo, wskazać adres strumienia oraz zdecydować, które źródła mają być aktywne. Dla plików wideo dostępna jest opcja startu od losowego momentu, co ułatwia testy na nagraniach demonstracyjnych. Konfiguracja źródeł jest zapisywana w pliku ustawień aplikacji, oddzielnie od głównego pliku \texttt{inference.yaml}. Przykładowy ekran zarządzania źródłami pokazano na rysunku \ref{fig:konfiguracja-kamer}.
+Operator może przeskanować dostępne kamery, dodać plik wideo, wskazać adres strumienia oraz zdecydować, które źródła mają być aktywne. Dla plików wideo dostępna jest opcja startu od losowego momentu, co ułatwia testy na nagraniach demonstracyjnych. Konfiguracja źródeł jest zapisywana w pliku ustawień aplikacji, oddzielnie od głównego pliku \texttt{inference.yaml}. Takie rozdzielenie jest wygodne, ponieważ zmiany w kamerach nie wymagają modyfikowania głównej konfiguracji modelu i progów detekcji. Przykładowy ekran zarządzania źródłami pokazano na rysunku \ref{fig:konfiguracja-kamer}.
 
 \begin{figure}[H]
 \centering
@@ -56,9 +58,9 @@ Dla każdego źródła można ustawić maskę obszaru, który ma być ignorowany
 
 \subsection{Detekcja, tracking i klasyfikacja intruzów}
 
-Detekcja osób realizowana jest przez model YOLO. Wyniki modelu są następnie przekazywane do trackera, który stabilizuje wykrycia i pozwala utrzymać ciągłość identyfikacji osoby pomiędzy klatkami. Dzięki temu etykiety na podglądzie są bardziej stabilne, a system może dokładniej określić, jak długo osoba pozostaje widoczna.
+Detekcja osób realizowana jest przez model YOLO \cite{redmon2016yolo,ultralyticsdocs}. Wyniki modelu są następnie przekazywane do trackera, który stabilizuje wykrycia i pozwala utrzymać ciągłość identyfikacji osoby pomiędzy klatkami. Dzięki temu etykiety na podglądzie są bardziej stabilne, a system może dokładniej określić, jak długo osoba pozostaje widoczna. Ma to znaczenie przy zapisie zdarzeń, ponieważ alarm nie powinien być tworzony wyłącznie na podstawie pojedynczej przypadkowej klatki.
 
-W trybie dziennym dodatkowo wykonywana jest analiza ubioru. System wykorzystuje maskę segmentacyjną osoby, wycina z niej odpowiednie obszary sylwetki i porównuje kolor ubioru z ustawionym wzorcem. W trybie nocnym analiza ubioru jest pomijana, a każda wykryta osoba jest traktowana jako potencjalny intruz.
+W trybie dziennym dodatkowo wykonywana jest analiza ubioru. System wykorzystuje maskę segmentacyjną osoby, wycina z niej odpowiednie obszary sylwetki i porównuje kolor ubioru z ustawionym wzorcem. Osoba zgodna ze wzorcem może zostać oznaczona jako pracownik, natomiast osoba niespełniająca warunku ubioru jest oznaczana jako intruz. W trybie nocnym analiza ubioru jest pomijana, a każda wykryta osoba jest traktowana jako potencjalny intruz.
 
 \subsection{Zapis i przegląd zdarzeń}
 
@@ -81,7 +83,7 @@ W zakładce podglądu znajduje się również widok nagrań. Operator może wczy
 
 Ustawienia aplikacji można zapisywać jako presety i później przywracać. Pozwala to przygotować kilka wariantów pracy, na przykład konfigurację oszczędną, demonstracyjną lub nastawioną na dokładność.
 
-Zakładka ustawień zawiera także katalog modeli YOLO. Aplikacja prezentuje dostępne modele, ich źródło, rozmiar oraz status pobrania. Operator może pobrać wybrany model bez znajomości programowania, a następnie załadować go do działania.
+Zakładka ustawień zawiera także katalog modeli YOLO. Aplikacja prezentuje dostępne modele, ich źródło, rozmiar oraz status pobrania. Operator może pobrać wybrany model bez znajomości programowania, a następnie załadować go do działania. W tym samym miejscu można porównać warianty modeli, na przykład lżejszy model nano i większe modele nastawione na dokładność. Pozwala to dobrać konfigurację do liczby kamer, oczekiwanej płynności oraz możliwości GPU lub CPU.
 
 W zakładce logów zapisywane są komunikaty o starcie aplikacji, ładowaniu modeli, zmianach konfiguracji, zapisie zdarzeń oraz błędach runtime. Logi mogą zostać wyeksportowane do pliku, co ułatwia analizę problemów i dokumentowanie testów. Przykład takiej zakładki pokazano na rysunku \ref{fig:logi}.
 
