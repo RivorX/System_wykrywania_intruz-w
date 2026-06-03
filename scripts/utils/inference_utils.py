@@ -5,6 +5,7 @@ from datetime import datetime
 from math import ceil
 import os
 import random
+import time
 from pathlib import Path
 from typing import Any
 
@@ -52,24 +53,48 @@ def _open_video_with_backend(video_path: Path, backend: int | None) -> cv2.Video
     return capture
 
 
-def _open_camera_capture(camera_index: int) -> cv2.VideoCapture:
-    if os.name == "nt":
-        capture = cv2.VideoCapture(camera_index, cv2.CAP_MSMF)
-        if capture.isOpened():
+def _camera_backends() -> list[int | None]:
+    if os.name != "nt":
+        return [None]
+
+    backends: list[int | None] = []
+    for backend_name in ("CAP_DSHOW", "CAP_MSMF"):
+        if hasattr(cv2, backend_name):
+            backends.append(int(getattr(cv2, backend_name)))
+    backends.append(None)
+    return backends
+
+
+def camera_capture_can_read(capture: cv2.VideoCapture, attempts: int = 6) -> bool:
+    for attempt in range(max(1, attempts)):
+        ok, frame = capture.read()
+        if ok and frame is not None and getattr(frame, "size", 0) > 0:
+            return True
+        if attempt + 1 < attempts:
+            time.sleep(0.05)
+    return False
+
+
+def _open_camera_capture(camera_index: int, *, validate_frame: bool = True) -> cv2.VideoCapture:
+    for backend in _camera_backends():
+        capture = cv2.VideoCapture(camera_index) if backend is None else cv2.VideoCapture(camera_index, backend)
+        if not capture.isOpened():
+            capture.release()
+            continue
+        if not validate_frame or camera_capture_can_read(capture):
             return capture
         capture.release()
-    return cv2.VideoCapture(camera_index)
+
+    return cv2.VideoCapture()
 
 
 def scan_available_cameras(max_index: int = 8) -> list[int]:
     available: list[int] = []
     for camera_index in range(max_index + 1):
-        capture = _open_camera_capture(camera_index)
+        capture = _open_camera_capture(camera_index, validate_frame=True)
 
         if capture.isOpened():
-            ok, _ = capture.read()
-            if ok:
-                available.append(camera_index)
+            available.append(camera_index)
         capture.release()
 
     return available

@@ -68,6 +68,7 @@ from PyQt6.QtWidgets import (
 
 from utils.config_utils import load_yaml, resolve_path, save_yaml
 from utils.inference_utils import (
+    camera_capture_can_read,
     open_capture,
     open_video_file_capture,
     resolve_security_mode,
@@ -6650,10 +6651,23 @@ class InferenceWindow(QMainWindow):
                     except Exception:  # noqa: BLE001
                         pass
 
+                if not camera_capture_can_read(runtime.capture, attempts=3):
+                    self._queue_async_notice(
+                        f"[warn] Camera '{source_name}' rejected requested "
+                        "resolution/FPS; reopening with default camera settings."
+                    )
+                    try:
+                        runtime.capture.release()
+                    except Exception:  # noqa: BLE001
+                        pass
+                    runtime.capture = open_capture(runtime.source)
+                    ok = runtime.capture.isOpened()
+
                 requested_fps = float(self.runtime_cfg.get("camera_fps", 30))
                 runtime.source_fps = max(1.0, requested_fps)
 
-            self._start_capture_reader(source_name, runtime)
+            if ok:
+                self._start_capture_reader(source_name, runtime)
         if ok:
             self._reset_tracker_for_source(source_name, runtime)
 
