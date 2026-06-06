@@ -14,7 +14,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -88,6 +88,8 @@ DAY_SEG_MODEL_SUGGESTIONS = ["yolo26n-seg.pt", "yolo26s-seg.pt", "yolo26m-seg.pt
 UNIFORM_TOP_DEFAULT = "#2F5FA8"
 UNIFORM_BOTTOM_DEFAULT = "#1F2430"
 UNIFORM_COLOR_TOLERANCE_DEFAULT = 42.0
+UNIFORM_COLOR_TOLERANCE_MIN = 0.0
+UNIFORM_COLOR_TOLERANCE_MAX = 100.0
 UNIFORM_MIN_MASK_PIXELS_DEFAULT = 180
 
 
@@ -108,6 +110,7 @@ class PersonDetection:
     has_segmentation: bool = False
     label: str = ""
     visible_section_count: int = 0
+    uniform_cached_decision: bool = False
 
 
 def _normalize_hex_color(value: Any, fallback: str) -> str:
@@ -140,6 +143,58 @@ def _lab_color_distance(color_a: tuple[int, int, int], color_b: tuple[int, int, 
     first = lab[0, 0].astype(np.float32)
     second = lab[0, 1].astype(np.float32)
     return float(np.linalg.norm(first - second))
+
+
+def _bgr_hsv(color: tuple[int, int, int]) -> tuple[int, int, int]:
+    sample = np.array([[list(color)]], dtype=np.uint8)
+    hsv = cv2.cvtColor(sample, cv2.COLOR_BGR2HSV)[0, 0]
+    return int(hsv[0]), int(hsv[1]), int(hsv[2])
+
+
+def _hue_distance(hue_a: int, hue_b: int) -> int:
+    diff = abs(int(hue_a) - int(hue_b))
+    return min(diff, 180 - diff)
+
+
+def _uniform_color_matches(
+    sample_bgr: tuple[int, int, int],
+    target_bgr: tuple[int, int, int],
+    tolerance: float,
+) -> bool:
+    distance = _lab_color_distance(sample_bgr, target_bgr)
+    if distance <= tolerance:
+        return True
+
+    target_hue, target_sat, target_value = _bgr_hsv(target_bgr)
+    sample_hue, sample_sat, sample_value = _bgr_hsv(sample_bgr)
+
+    if target_sat > 28 or sample_sat > 64:
+        if target_sat <= 28 or sample_sat <= 18:
+            return False
+
+        hue_limit = float(_clamp(4.0 + (float(tolerance) * 0.18), 6.0, 20.0))
+        relaxed_tolerance = min(115.0, (float(tolerance) * 1.35) + 10.0)
+        saturation_gap = abs(float(sample_sat) - float(target_sat))
+        value_gap = abs(float(sample_value) - float(target_value))
+        saturation_limit = 70.0 + (float(tolerance) * 0.70)
+        value_limit = 70.0 + (float(tolerance) * 1.05)
+        return (
+            _hue_distance(sample_hue, target_hue) <= hue_limit
+            and distance <= relaxed_tolerance
+            and saturation_gap <= saturation_limit
+            and value_gap <= value_limit
+        )
+
+    relaxed_tolerance = min(UNIFORM_COLOR_TOLERANCE_MAX, (float(tolerance) * 1.25) + 6.0)
+    if distance > relaxed_tolerance:
+        return False
+    if target_value >= 180:
+        min_brightness = max(130.0, float(target_value) - (float(tolerance) * 2.2))
+        return float(sample_value) >= min_brightness
+    if target_value <= 55:
+        max_brightness = min(110.0, float(target_value) + (float(tolerance) * 1.5) + 18.0)
+        return float(sample_value) <= max_brightness
+    return True
 
 
 def _compute_region_color(
@@ -383,6 +438,14 @@ def _clamp(value: float, lower: float, upper: float) -> float:
     return max(lower, min(upper, value))
 
 
+def _uniform_color_tolerance(value: Any) -> float:
+    try:
+        raw = float(value)
+    except Exception:  # noqa: BLE001
+        raw = UNIFORM_COLOR_TOLERANCE_DEFAULT
+    return float(_clamp(raw, UNIFORM_COLOR_TOLERANCE_MIN, UNIFORM_COLOR_TOLERANCE_MAX))
+
+
 def _ema(previous: float, value: float, alpha: float) -> float:
     if previous <= 0.0:
         return value
@@ -401,6 +464,40 @@ def _to_relative_or_abs(path_value: Path) -> str:
         return str(path_value.resolve().relative_to(PROJECT_ROOT.resolve()))
     except Exception:  # noqa: BLE001
         return str(path_value.resolve())
+
+
+def _scaled_annotation_style(
+    frame: np.ndarray,
+    *,
+    reference_height: float = 720.0,
+    label_font_base: float = 0.48,
+    status_font_base: float = 0.46,
+    min_scale: float = 0.45,
+    max_scale: float = 4.0,
+) -> dict[str, float | int]:
+    frame_h = max(1, int(frame.shape[0]) if getattr(frame, "ndim", 0) >= 2 else 720)
+    reference = max(120.0, float(reference_height))
+    resolution_scale = float(_clamp(frame_h / reference, float(min_scale), float(max_scale)))
+    label_font_scale = float(_clamp(float(label_font_base) * resolution_scale, 0.18, 2.4))
+    status_font_scale = float(_clamp(float(status_font_base) * resolution_scale, 0.18, 2.2))
+    text_thickness = max(1, int(round(1.25 * resolution_scale)))
+    box_thickness = max(1, int(round(1.75 * resolution_scale)))
+    pad_x = max(3, int(round(4.0 * resolution_scale)))
+    pad_y = max(2, int(round(3.0 * resolution_scale)))
+    gap = max(3, int(round(6.0 * resolution_scale)))
+    status_x = max(4, int(round(10.0 * resolution_scale)))
+    status_y = max(14, int(round(24.0 * resolution_scale)))
+    return {
+        "label_font_scale": label_font_scale,
+        "status_font_scale": status_font_scale,
+        "text_thickness": text_thickness,
+        "box_thickness": box_thickness,
+        "pad_x": pad_x,
+        "pad_y": pad_y,
+        "gap": gap,
+        "status_x": status_x,
+        "status_y": status_y,
+    }
 
 
 def _format_seconds(seconds: float) -> str:
@@ -642,6 +739,7 @@ class SourceRuntime:
     alert: bool = False
     mode: str = "day"
     last_boxes: list[PersonDetection] | None = None
+    detection_box_memory: list[tuple[PersonDetection, float]] = field(default_factory=list)
     last_tracked_boxes: list[PersonDetection] | None = None
     last_input: np.ndarray | None = None
     last_output: np.ndarray | None = None
@@ -671,6 +769,7 @@ class SourceRuntime:
     event_clip_generation: int = 0
     event_clip_failed: bool = False
     last_tracker_update_ts: float = 0.0
+    camera_settings_rejected: bool = False
 
     def release(self) -> None:
         if self.capture_reader_stop_event is not None:
@@ -1422,6 +1521,16 @@ class InferenceWindow(QMainWindow):
         self.tracker_cfg = dict(self.config.get("tracker", {}) or {})
         self.events_cfg = dict(self.config.get("events", {}) or {})
         self.debug_cfg = dict(self.config.get("debug", {}) or {})
+        self.runtime_cfg.setdefault("annotation_reference_height", 720)
+        self.runtime_cfg.setdefault("annotation_label_font_scale", 0.48)
+        self.runtime_cfg.setdefault("annotation_status_font_scale", 0.46)
+        self.runtime_cfg.setdefault("annotation_min_resolution_scale", 0.45)
+        self.runtime_cfg.setdefault("annotation_max_resolution_scale", 4.0)
+        self.runtime_cfg.setdefault("camera_backend", "msmf")
+        self.runtime_cfg.setdefault("uniform_recheck_interval_sec", 5.0)
+        self.runtime_cfg.setdefault("uniform_worker_hold_sec", 5.0)
+        self.runtime_cfg.setdefault("uniform_memory_ttl_sec", 8.0)
+        self.runtime_cfg.setdefault("detection_box_hold_sec", 0.5)
         self.debug_cfg.setdefault("enabled", False)
         self.debug_cfg.setdefault("console", True)
         self.debug_cfg.setdefault("profiling", True)
@@ -1476,6 +1585,23 @@ class InferenceWindow(QMainWindow):
         self.loop_videos = bool(self.runtime_cfg.get("loop_videos", True))
         self.live_tile_spacing = max(0, int(self.runtime_cfg.get("live_tile_spacing", 4)))
         self.live_tile_header_visible = bool(self.runtime_cfg.get("show_live_tile_headers", True))
+        self.camera_backend = str(self.runtime_cfg.get("camera_backend", "msmf")).strip().lower() or "msmf"
+        self._detection_box_hold_sec = float(
+            _clamp(float(self.runtime_cfg.get("detection_box_hold_sec", 0.5)), 0.0, 5.0)
+        )
+        self.annotation_reference_height = max(120.0, float(self.runtime_cfg.get("annotation_reference_height", 720.0)))
+        self.annotation_label_font_scale = float(
+            _clamp(float(self.runtime_cfg.get("annotation_label_font_scale", 0.48)), 0.20, 1.20)
+        )
+        self.annotation_status_font_scale = float(
+            _clamp(float(self.runtime_cfg.get("annotation_status_font_scale", 0.46)), 0.20, 1.20)
+        )
+        self.annotation_min_resolution_scale = float(
+            _clamp(float(self.runtime_cfg.get("annotation_min_resolution_scale", 0.45)), 0.10, 1.50)
+        )
+        self.annotation_max_resolution_scale = float(
+            _clamp(float(self.runtime_cfg.get("annotation_max_resolution_scale", 4.0)), 1.0, 8.0)
+        )
         # Always start with the navigation tabs visible, even if the previous session hid them.
         self.navigation_tabs_visible = True
 
@@ -1509,8 +1635,12 @@ class InferenceWindow(QMainWindow):
             _clamp(float(self.runtime_cfg.get("uniform_memory_min_worker_score", 0.55)), 0.2, 0.95)
         )
         self._uniform_memory_max_bad_streak = max(1, int(self.runtime_cfg.get("uniform_memory_max_bad_streak", 4)))
-        self._uniform_memory_ttl_sec = max(1.0, float(self.runtime_cfg.get("uniform_memory_ttl_sec", 5.0)))
-        self._uniform_recheck_interval_sec = max(0.0, float(self.runtime_cfg.get("uniform_recheck_interval_sec", 0.30)))
+        self._uniform_worker_hold_sec = max(0.0, float(self.runtime_cfg.get("uniform_worker_hold_sec", 5.0)))
+        self._uniform_memory_ttl_sec = max(
+            self._uniform_worker_hold_sec + 1.0,
+            float(self.runtime_cfg.get("uniform_memory_ttl_sec", 8.0)),
+        )
+        self._uniform_recheck_interval_sec = max(0.0, float(self.runtime_cfg.get("uniform_recheck_interval_sec", 5.0)))
         self._uniform_recheck_iou = float(_clamp(float(self.runtime_cfg.get("uniform_recheck_iou", 0.85)), 0.2, 0.99))
         self._uniform_max_fresh_per_cycle = max(1, int(self.runtime_cfg.get("uniform_max_fresh_per_cycle", 2)))
         self._event_writer_cond = threading.Condition()
@@ -2558,7 +2688,7 @@ class InferenceWindow(QMainWindow):
         )
 
         self.uniform_tolerance_spin = QDoubleSpinBox()
-        self.uniform_tolerance_spin.setRange(5.0, 120.0)
+        self.uniform_tolerance_spin.setRange(UNIFORM_COLOR_TOLERANCE_MIN, UNIFORM_COLOR_TOLERANCE_MAX)
         self.uniform_tolerance_spin.setSingleStep(1.0)
         self.uniform_tolerance_spin.setDecimals(1)
 
@@ -2573,7 +2703,9 @@ class InferenceWindow(QMainWindow):
 
         self.uniform_help_label = QLabel(
             "W trybie dziennym aplikacja uzywa modelu segmentacji osoby, "
-            "wycina sylwetke maska i porownuje kolor gornej oraz dolnej czesci ubioru z wzorcem."
+            "wycina sylwetke maska i porownuje kolor gornej oraz dolnej czesci ubioru z wzorcem. "
+            "Tolerancja 0-100: im wieksza, tym wiecej odcieni uznaje za zgodne; biel i czern sa "
+            "dopasowywane z lekkim luzem na cien i ekspozycje kamery."
         )
         self.uniform_help_label.setWordWrap(True)
         self.uniform_help_label.setStyleSheet("color: #9fb0c9;")
@@ -3923,7 +4055,9 @@ class InferenceWindow(QMainWindow):
         self.events_once_per_streak_checkbox.setChecked(bool(self.events_cfg.get("once_per_streak", True)))
         self.events_output_dir_edit.setText(str(self.events_cfg.get("output_dir", "logs/app/events")))
         self.uniform_enabled_checkbox.setChecked(bool(self.uniform_cfg.get("enabled", True)))
-        self.uniform_tolerance_spin.setValue(float(self.uniform_cfg.get("color_tolerance", UNIFORM_COLOR_TOLERANCE_DEFAULT)))
+        self.uniform_tolerance_spin.setValue(
+            _uniform_color_tolerance(self.uniform_cfg.get("color_tolerance", UNIFORM_COLOR_TOLERANCE_DEFAULT))
+        )
         self.uniform_min_pixels_spin.setValue(int(self.uniform_cfg.get("min_mask_pixels", UNIFORM_MIN_MASK_PIXELS_DEFAULT)))
         self._selected_uniform_top_color = _normalize_hex_color(
             self.uniform_cfg.get("top_color", UNIFORM_TOP_DEFAULT),
@@ -5089,7 +5223,7 @@ class InferenceWindow(QMainWindow):
     def _refresh_camera_list(self) -> None:
         max_index = int(self.runtime_cfg.get("scan_max_index", 8))
         self.camera_combo.clear()
-        available = list(scan_available_cameras(max_index=max_index))
+        available = list(scan_available_cameras(max_index=max_index, preferred_backend=self.camera_backend))
         if not available:
             self.camera_combo.addItem("Brak dostepnych kamer", -1)
             model = self.camera_combo.model()
@@ -6208,6 +6342,61 @@ class InferenceWindow(QMainWindow):
             self._infer_worker_rr_cursor = 0
             self._infer_has_work_event.clear()
 
+    def _stabilize_detection_boxes(
+        self,
+        runtime: SourceRuntime,
+        boxes: list[PersonDetection],
+        now_ts: float,
+    ) -> list[PersonDetection]:
+        hold_sec = max(0.0, float(self._detection_box_hold_sec))
+        current_boxes = [replace(box) for box in boxes]
+        if hold_sec <= 1e-6:
+            runtime.detection_box_memory = [(replace(box), float(now_ts)) for box in current_boxes]
+            return current_boxes
+
+        previous = [
+            (box, ts)
+            for box, ts in runtime.detection_box_memory
+            if (now_ts - float(ts)) <= hold_sec
+        ]
+        matched_previous: set[int] = set()
+        for current in current_boxes:
+            best_index = -1
+            best_iou = 0.0
+            for index, (old_box, _old_ts) in enumerate(previous):
+                if index in matched_previous:
+                    continue
+                if current.track_id is not None and old_box.track_id is not None and int(current.track_id) != int(old_box.track_id):
+                    continue
+                score = self._bbox_iou(current, old_box)
+                if score > best_iou:
+                    best_iou = score
+                    best_index = index
+            if best_index >= 0 and best_iou >= 0.25:
+                matched_previous.add(best_index)
+
+        stabilized = list(current_boxes)
+        retained_memory: list[tuple[PersonDetection, float]] = [(replace(box), float(now_ts)) for box in current_boxes]
+        for index, (old_box, old_ts) in enumerate(previous):
+            if index in matched_previous:
+                continue
+            overlaps_current = any(self._bbox_iou(old_box, current) >= 0.35 for current in current_boxes)
+            if overlaps_current:
+                continue
+            held_box = replace(old_box)
+            stabilized.append(held_box)
+            retained_memory.append((replace(old_box), float(old_ts)))
+
+        runtime.detection_box_memory = retained_memory
+        return stabilized
+
+    def _counts_from_stabilized_boxes(self, boxes: list[PersonDetection], mode: str) -> tuple[int, int]:
+        tracked_ids = {box.track_id for box in boxes if box.track_id is not None}
+        person_count = len(tracked_ids) if tracked_ids else len(boxes)
+        if mode == "night" or not self._uniform_detection_enabled():
+            return person_count, person_count
+        return person_count, sum(1 for box in boxes if box.is_intruder)
+
     def _inference_worker_loop(self) -> None:
         while not self._infer_stop_event.is_set():
             if not self._infer_has_work_event.wait(0.05):
@@ -6281,12 +6470,15 @@ class InferenceWindow(QMainWindow):
                 infer_delta = max(1e-6, payload.infer_ts - runtime.last_infer_ts)
                 runtime.infer_fps = 1.0 / infer_delta
             runtime.last_infer_ts = payload.infer_ts
-            runtime.person_count = payload.person_count
-            runtime.intruder_count = payload.intruder_count
+            stabilized_boxes = self._stabilize_detection_boxes(runtime, payload.boxes, payload.infer_ts)
+            person_count, intruder_count = self._counts_from_stabilized_boxes(stabilized_boxes, payload.mode)
+            runtime.person_count = person_count
+            runtime.intruder_count = intruder_count
             runtime.mode = payload.mode
-            runtime.alert = payload.alert
-            runtime.last_boxes = payload.boxes
-            runtime.status = "alert" if payload.alert else "ok"
+            alert_value = intruder_count if payload.mode == "day" else person_count
+            runtime.alert = should_raise_alert(alert_value, payload.mode, self.security_cfg)
+            runtime.last_boxes = stabilized_boxes
+            runtime.status = "alert" if runtime.alert else "ok"
         return True
 
     def _update_load_shed_state(self, now_ts: float) -> None:
@@ -6576,7 +6768,11 @@ class InferenceWindow(QMainWindow):
 
         self._finalize_event_clip(source_name, runtime, time.perf_counter())
         runtime.release()
-        runtime.capture = open_capture(runtime.source)
+        capture_source = runtime.source
+        if source_type == "camera" and not capture_source.get("backend") and not capture_source.get("camera_backend"):
+            capture_source = dict(runtime.source)
+            capture_source["backend"] = self.camera_backend
+        runtime.capture = open_capture(capture_source)
         ok = runtime.capture.isOpened()
         runtime.source_fps = 0.0
         runtime.last_capture_frame_ts = 0.0
@@ -6598,6 +6794,7 @@ class InferenceWindow(QMainWindow):
         runtime.person_count = 0
         runtime.intruder_count = 0
         runtime.last_boxes = None
+        runtime.detection_box_memory.clear()
         runtime.last_decorated_capture_seq = 0
         runtime.last_decorated_infer_ts = 0.0
         runtime.no_frame_refresh_needed = True
@@ -6635,23 +6832,25 @@ class InferenceWindow(QMainWindow):
                 camera_width = int(self.runtime_cfg.get("camera_width", 0))
                 camera_height = int(self.runtime_cfg.get("camera_height", 0))
                 camera_fps = float(self.runtime_cfg.get("camera_fps", 0))
-                if camera_width > 0:
+                apply_requested_camera_settings = not runtime.camera_settings_rejected
+                if apply_requested_camera_settings and camera_width > 0:
                     try:
                         runtime.capture.set(cv2.CAP_PROP_FRAME_WIDTH, float(camera_width))
                     except Exception:  # noqa: BLE001
                         pass
-                if camera_height > 0:
+                if apply_requested_camera_settings and camera_height > 0:
                     try:
                         runtime.capture.set(cv2.CAP_PROP_FRAME_HEIGHT, float(camera_height))
                     except Exception:  # noqa: BLE001
                         pass
-                if camera_fps > 0:
+                if apply_requested_camera_settings and camera_fps > 0:
                     try:
                         runtime.capture.set(cv2.CAP_PROP_FPS, float(camera_fps))
                     except Exception:  # noqa: BLE001
                         pass
 
-                if not camera_capture_can_read(runtime.capture, attempts=3):
+                if apply_requested_camera_settings and not camera_capture_can_read(runtime.capture, attempts=3):
+                    runtime.camera_settings_rejected = True
                     self._queue_async_notice(
                         f"[warn] Camera '{source_name}' rejected requested "
                         "resolution/FPS; reopening with default camera settings."
@@ -6660,11 +6859,19 @@ class InferenceWindow(QMainWindow):
                         runtime.capture.release()
                     except Exception:  # noqa: BLE001
                         pass
-                    runtime.capture = open_capture(runtime.source)
-                    ok = runtime.capture.isOpened()
+                    runtime.capture = open_capture(capture_source)
+                    ok = runtime.capture.isOpened() and camera_capture_can_read(runtime.capture, attempts=3)
+                    if not ok:
+                        self._queue_async_notice(
+                            f"[warn] Camera '{source_name}' cannot deliver frames with default settings."
+                        )
 
                 requested_fps = float(self.runtime_cfg.get("camera_fps", 30))
-                runtime.source_fps = max(1.0, requested_fps)
+                try:
+                    actual_fps = float(runtime.capture.get(cv2.CAP_PROP_FPS)) if runtime.capture is not None else 0.0
+                except Exception:  # noqa: BLE001
+                    actual_fps = 0.0
+                runtime.source_fps = actual_fps if actual_fps > 1e-3 else max(1.0, requested_fps)
 
             if ok:
                 self._start_capture_reader(source_name, runtime)
@@ -6935,7 +7142,7 @@ class InferenceWindow(QMainWindow):
 
         self._attach_track_ids_to_day_detections(detections_only, tracked_boxes)
 
-        tolerance = float(self.uniform_cfg.get("color_tolerance", UNIFORM_COLOR_TOLERANCE_DEFAULT))
+        tolerance = _uniform_color_tolerance(self.uniform_cfg.get("color_tolerance", UNIFORM_COLOR_TOLERANCE_DEFAULT))
         min_pixels = max(20, int(self.uniform_cfg.get("min_mask_pixels", UNIFORM_MIN_MASK_PIXELS_DEFAULT)))
         center_band_fraction = _clamp(float(self.uniform_cfg.get("center_band_fraction", 0.6)), 0.3, 1.0)
         target_upper_hex = _normalize_hex_color(self.uniform_cfg.get("top_color", UNIFORM_TOP_DEFAULT), UNIFORM_TOP_DEFAULT)
@@ -6954,6 +7161,9 @@ class InferenceWindow(QMainWindow):
             cache_entry = None
             if detection.track_id is not None:
                 cache_entry = source_memory_snapshot.get(int(detection.track_id))
+            if cache_entry and self._apply_worker_hold_decision(detection, cache_entry, now_ts):
+                detections.append(detection)
+                continue
             if (
                 cache_entry
                 and self._uniform_recheck_interval_sec > 0.0
@@ -7029,13 +7239,13 @@ class InferenceWindow(QMainWindow):
                 if upper_sample[1] >= min_section_pixels:
                     visible_section_count += 1
                 if upper_sample[1] >= min_pixels:
-                    upper_match = _lab_color_distance(_hex_to_bgr(upper_sample[0]), target_upper_bgr) <= tolerance
+                    upper_match = _uniform_color_matches(_hex_to_bgr(upper_sample[0]), target_upper_bgr, tolerance)
             if lower_sample is not None:
                 detection.lower_color_hex = lower_sample[0]
                 if lower_sample[1] >= min_section_pixels:
                     visible_section_count += 1
                 if lower_sample[1] >= min_pixels:
-                    lower_match = _lab_color_distance(_hex_to_bgr(lower_sample[0]), target_lower_bgr) <= tolerance
+                    lower_match = _uniform_color_matches(_hex_to_bgr(lower_sample[0]), target_lower_bgr, tolerance)
 
             detection.upper_match = upper_match
             detection.lower_match = lower_match
@@ -7261,6 +7471,29 @@ class InferenceWindow(QMainWindow):
         detection.visible_section_count = int(entry.get("visible_section_count", 0) or 0)
         detection.is_intruder = bool(entry.get("is_intruder", True))
         detection.label = "intruz" if detection.is_intruder else "pracownik"
+        detection.uniform_cached_decision = True
+        return True
+
+    def _apply_worker_hold_decision(
+        self,
+        detection: PersonDetection,
+        entry: dict[str, Any],
+        now_ts: float,
+    ) -> bool:
+        hold_until = float(entry.get("worker_hold_until_ts", 0.0))
+        if hold_until <= now_ts or bool(entry.get("is_intruder", True)):
+            return False
+
+        detection.has_segmentation = bool(entry.get("has_segmentation", False))
+        detection.upper_match = entry.get("upper_match")
+        detection.lower_match = entry.get("lower_match")
+        detection.upper_color_hex = str(entry.get("upper_color_hex", "") or "")
+        detection.lower_color_hex = str(entry.get("lower_color_hex", "") or "")
+        detection.uniform_match = True
+        detection.visible_section_count = int(entry.get("visible_section_count", 0) or 0)
+        detection.is_intruder = False
+        detection.label = "pracownik"
+        detection.uniform_cached_decision = True
         return True
 
     def _store_uniform_analysis_cache(
@@ -7279,6 +7512,11 @@ class InferenceWindow(QMainWindow):
             if entry is None:
                 entry = {}
                 source_memory[track_id] = entry
+            previous_hold_until = float(entry.get("worker_hold_until_ts", 0.0))
+            if detection.is_intruder or detection.uniform_cached_decision:
+                worker_hold_until = previous_hold_until
+            else:
+                worker_hold_until = max(previous_hold_until, float(now_ts) + self._uniform_worker_hold_sec)
             entry.update(
                 {
                     "analysis_ts": float(now_ts),
@@ -7291,6 +7529,7 @@ class InferenceWindow(QMainWindow):
                     "uniform_match": detection.uniform_match,
                     "visible_section_count": int(detection.visible_section_count),
                     "is_intruder": bool(detection.is_intruder),
+                    "worker_hold_until_ts": float(worker_hold_until),
                     "last_seen_ts": float(now_ts),
                 }
             )
@@ -7386,6 +7625,11 @@ class InferenceWindow(QMainWindow):
                 else:
                     detection.label = "pracownik"
 
+                previous_hold_until = float(entry.get("worker_hold_until_ts", 0.0))
+                worker_hold_until = previous_hold_until
+                if not detection.is_intruder and not detection.uniform_cached_decision:
+                    worker_hold_until = max(previous_hold_until, now_ts + self._uniform_worker_hold_sec)
+
                 source_memory[track_id] = {
                     "score": score,
                     "bad_streak": bad_streak,
@@ -7401,6 +7645,7 @@ class InferenceWindow(QMainWindow):
                     "uniform_match": detection.uniform_match,
                     "visible_section_count": int(detection.visible_section_count),
                     "is_intruder": bool(detection.is_intruder),
+                    "worker_hold_until_ts": float(worker_hold_until),
                 }
 
     def _extract_mode_detections(
@@ -7461,35 +7706,62 @@ class InferenceWindow(QMainWindow):
         if not boxes:
             return output
 
+        frame_h, frame_w = output.shape[:2]
+        style = _scaled_annotation_style(
+            output,
+            reference_height=self.annotation_reference_height,
+            label_font_base=self.annotation_label_font_scale,
+            status_font_base=self.annotation_status_font_scale,
+            min_scale=self.annotation_min_resolution_scale,
+            max_scale=self.annotation_max_resolution_scale,
+        )
+        label_font_scale = float(style["label_font_scale"])
+        text_thickness = int(style["text_thickness"])
+        box_thickness = int(style["box_thickness"])
+        pad_x = int(style["pad_x"])
+        pad_y = int(style["pad_y"])
+        gap = int(style["gap"])
+
         for detection in boxes:
             x1, y1, x2, y2 = detection.x1, detection.y1, detection.x2, detection.y2
             box_color = (0, 0, 255) if detection.is_intruder else (42, 169, 107)
             if detection.uniform_match is None and not detection.is_intruder:
                 box_color = (255, 176, 0)
-            cv2.rectangle(output, (x1, y1), (x2, y2), box_color, 2)
+            cv2.rectangle(output, (x1, y1), (x2, y2), box_color, box_thickness)
             if detection.track_id is None:
                 base_label = detection.label or "person"
             else:
                 base_label = f"{detection.label or 'person'}#{detection.track_id}"
             label = f"{base_label} {detection.conf:.2f}"
-            (tw, th), baseline = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)
-            text_y = max(18, y1 - 6)
-            top = max(0, text_y - th - baseline - 4)
+            (tw, th), baseline = cv2.getTextSize(
+                label,
+                cv2.FONT_HERSHEY_SIMPLEX,
+                label_font_scale,
+                text_thickness,
+            )
+            label_w = tw + (pad_x * 2)
+            text_x = int(_clamp(float(x1), 0.0, float(max(0, frame_w - label_w))))
+            text_y = y1 - gap
+            top = text_y - th - baseline - pad_y
+            if top < 0:
+                text_y = min(frame_h - baseline - pad_y, y1 + th + baseline + (pad_y * 2) + gap)
+                top = max(0, text_y - th - baseline - pad_y)
+            bottom = min(frame_h, text_y + pad_y)
             cv2.rectangle(
                 output,
-                (x1, top),
-                (x1 + tw + 8, text_y + 2),
+                (text_x, top),
+                (min(frame_w, text_x + label_w), bottom),
                 box_color,
                 -1,
             )
             cv2.putText(
                 output,
                 label,
-                (x1 + 4, text_y),
+                (text_x + pad_x, text_y),
                 cv2.FONT_HERSHEY_SIMPLEX,
-                0.7,
+                label_font_scale,
                 (20, 20, 20),
-                2,
+                text_thickness,
                 cv2.LINE_AA,
             )
         return output
@@ -7511,7 +7783,24 @@ class InferenceWindow(QMainWindow):
         text = f"{source_name} | mode:{mode} | person:{person_count} | intruder:{intruder_count} | {status}"
 
         output = self._draw_person_boxes(frame, boxes)
-        cv2.putText(output, text, (10, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.65, color, 2, cv2.LINE_AA)
+        style = _scaled_annotation_style(
+            output,
+            reference_height=self.annotation_reference_height,
+            label_font_base=self.annotation_label_font_scale,
+            status_font_base=self.annotation_status_font_scale,
+            min_scale=self.annotation_min_resolution_scale,
+            max_scale=self.annotation_max_resolution_scale,
+        )
+        cv2.putText(
+            output,
+            text,
+            (int(style["status_x"]), int(style["status_y"])),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            float(style["status_font_scale"]),
+            color,
+            int(style["text_thickness"]),
+            cv2.LINE_AA,
+        )
         self._profile_add("draw", time.perf_counter() - draw_started_ts)
         return output
 
@@ -7620,6 +7909,7 @@ class InferenceWindow(QMainWindow):
                 runtime.fps = 0.0
                 runtime.person_count = 0
                 runtime.intruder_count = 0
+                runtime.detection_box_memory.clear()
                 runtime.person_visible_since_ts = 0.0
                 runtime.person_visible_duration_sec = 0.0
                 runtime.event_saved_in_streak = False
@@ -8949,6 +9239,8 @@ class InferenceWindow(QMainWindow):
         self.runtime_cfg["show_navigation_tabs"] = bool(self.navigation_tabs_visible)
         self.runtime_cfg["console_logs"] = bool(self.console_logs_enabled)
         self.runtime_cfg["suppress_opencv_warnings"] = bool(self.suppress_opencv_warnings)
+        self.runtime_cfg["camera_backend"] = str(getattr(self, "camera_backend", self.runtime_cfg.get("camera_backend", "msmf")))
+        self.runtime_cfg["detection_box_hold_sec"] = float(self._detection_box_hold_sec)
         self.runtime_cfg["auto_scan_cameras_on_startup"] = bool(self.auto_scan_cameras_on_startup)
         self.runtime_cfg["auto_start_live"] = bool(self.auto_start_live)
 
@@ -8961,7 +9253,7 @@ class InferenceWindow(QMainWindow):
             getattr(self, "_selected_uniform_bottom_color", self.uniform_cfg.get("bottom_color", UNIFORM_BOTTOM_DEFAULT)),
             UNIFORM_BOTTOM_DEFAULT,
         )
-        self.uniform_cfg["color_tolerance"] = float(self.uniform_tolerance_spin.value())
+        self.uniform_cfg["color_tolerance"] = _uniform_color_tolerance(self.uniform_tolerance_spin.value())
         self.uniform_cfg["min_mask_pixels"] = int(self.uniform_min_pixels_spin.value())
 
         previous_output_dir = self.events_output_dir
@@ -9122,7 +9414,8 @@ def main() -> None:
 
     if args.scan_cameras:
         max_index = int(runtime_cfg.get("scan_max_index", 8))
-        cameras = scan_available_cameras(max_index=max_index)
+        camera_backend = str(runtime_cfg.get("camera_backend", "msmf")).strip().lower() or "msmf"
+        cameras = scan_available_cameras(max_index=max_index, preferred_backend=camera_backend)
         if cameras:
             print("[camera] Available indexes:", ", ".join(str(index) for index in cameras))
         else:

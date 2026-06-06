@@ -54,20 +54,64 @@ def _open_video_with_backend(video_path: Path, backend: int | None) -> cv2.Video
 
 
 def _camera_backends() -> list[int | None]:
-    if os.name != "nt":
+    return _camera_backend_candidates()
+
+
+def _camera_backend_value(name: str) -> int | None:
+    normalized = str(name or "").strip().lower()
+    if normalized in {"", "auto", "default"}:
+        return None
+
+    aliases = {
+        "dshow": "CAP_DSHOW",
+        "directshow": "CAP_DSHOW",
+        "msmf": "CAP_MSMF",
+        "mediafoundation": "CAP_MSMF",
+        "v4l2": "CAP_V4L2",
+        "any": "CAP_ANY",
+    }
+    backend_attr = aliases.get(normalized, normalized.upper())
+    if not backend_attr.startswith("CAP_"):
+        backend_attr = f"CAP_{backend_attr}"
+    if hasattr(cv2, backend_attr):
+        return int(getattr(cv2, backend_attr))
+    return None
+
+
+def _camera_backend_candidates(preferred_backend: str | None = None) -> list[int | None]:
+    preferred = str(preferred_backend or "").strip().lower()
+    if preferred in {"any", "cap_any"}:
         return [None]
 
-    backends: list[int | None] = []
-    for backend_name in ("CAP_DSHOW", "CAP_MSMF"):
-        if hasattr(cv2, backend_name):
-            backends.append(int(getattr(cv2, backend_name)))
-    backends.append(None)
-    return backends
+    candidates: list[int | None] = []
+    preferred_value = _camera_backend_value(preferred)
+    if preferred and preferred_value is not None:
+        return [preferred_value]
+
+    if os.name == "nt":
+        # MSMF usually opens webcams quietly on Windows. Falling back to CAP_ANY can route
+        # through FFmpeg/dshow and produce noisy "Failed list devices" warnings.
+        for backend_name in ("CAP_MSMF", "CAP_DSHOW"):
+            if hasattr(cv2, backend_name):
+                backend_value = int(getattr(cv2, backend_name))
+                if backend_value not in candidates:
+                    candidates.append(backend_value)
+        return candidates
+
+    if hasattr(cv2, "CAP_V4L2"):
+        v4l2_value = int(getattr(cv2, "CAP_V4L2"))
+        if v4l2_value not in candidates:
+            candidates.append(v4l2_value)
+    candidates.append(None)
+    return candidates
 
 
 def camera_capture_can_read(capture: cv2.VideoCapture, attempts: int = 6) -> bool:
     for attempt in range(max(1, attempts)):
-        ok, frame = capture.read()
+        try:
+            ok, frame = capture.read()
+        except cv2.error:
+            return False
         if ok and frame is not None and getattr(frame, "size", 0) > 0:
             return True
         if attempt + 1 < attempts:
@@ -75,8 +119,13 @@ def camera_capture_can_read(capture: cv2.VideoCapture, attempts: int = 6) -> boo
     return False
 
 
-def _open_camera_capture(camera_index: int, *, validate_frame: bool = True) -> cv2.VideoCapture:
-    for backend in _camera_backends():
+def _open_camera_capture(
+    camera_index: int,
+    *,
+    validate_frame: bool = True,
+    preferred_backend: str | None = None,
+) -> cv2.VideoCapture:
+    for backend in _camera_backend_candidates(preferred_backend):
         capture = cv2.VideoCapture(camera_index) if backend is None else cv2.VideoCapture(camera_index, backend)
         if not capture.isOpened():
             capture.release()
@@ -88,10 +137,10 @@ def _open_camera_capture(camera_index: int, *, validate_frame: bool = True) -> c
     return cv2.VideoCapture()
 
 
-def scan_available_cameras(max_index: int = 8) -> list[int]:
+def scan_available_cameras(max_index: int = 8, *, preferred_backend: str | None = None) -> list[int]:
     available: list[int] = []
     for camera_index in range(max_index + 1):
-        capture = _open_camera_capture(camera_index, validate_frame=True)
+        capture = _open_camera_capture(camera_index, validate_frame=True, preferred_backend=preferred_backend)
 
         if capture.isOpened():
             available.append(camera_index)
@@ -136,7 +185,8 @@ def open_capture(source: dict[str, Any]) -> cv2.VideoCapture:
 
     if source_type == "camera":
         camera_index = int(raw_value)
-        return _open_camera_capture(camera_index)
+        preferred_backend = source.get("backend", source.get("camera_backend"))
+        return _open_camera_capture(camera_index, preferred_backend=preferred_backend)
 
     if source_type == "video":
         capture = open_video_file_capture(str(raw_value))

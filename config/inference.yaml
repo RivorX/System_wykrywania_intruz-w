@@ -50,7 +50,7 @@ tracker:
   track_high_thresh: 0.5
   track_low_thresh: 0.1
   new_track_thresh: 0.6
-  track_buffer: 15
+  track_buffer: 45
   match_thresh: 0.8
   fuse_score: false
   proximity_thresh: 0.5
@@ -111,14 +111,23 @@ runtime:
   model_target_fps: 24.0
   max_infer_per_tick: 6
   infer_batch_coalesce_ms: 5.0
-  uniform_recheck_interval_sec: 1.0
+  uniform_recheck_interval_sec: 5.0
   uniform_recheck_iou: 0.80
   uniform_max_fresh_per_cycle: 1
+  uniform_worker_hold_sec: 5.0
+  uniform_memory_ttl_sec: 8.0
   capture_buffer_size: 1
-  camera_width: 1280
-  camera_height: 720
-  camera_fps: 30
+  camera_backend: msmf
+  camera_width: 0
+  camera_height: 0
+  camera_fps: 0
+  detection_box_hold_sec: 0.5
   live_tile_spacing: 3
+  annotation_reference_height: 720
+  annotation_label_font_scale: 0.48
+  annotation_status_font_scale: 0.46
+  annotation_min_resolution_scale: 0.45
+  annotation_max_resolution_scale: 4.0
 
 # === DEBUG ===
 # ------------------------------------------------------------
